@@ -1,0 +1,3 @@
+Device.LocalAgent.Controller.1.Alias "ctrl-${IDX}"
+Device.LocalAgent.Controller.1.Enable "false"
+Device.LocalAgent.Controller.1.EndpointID "self::ctrl-${SN}"
