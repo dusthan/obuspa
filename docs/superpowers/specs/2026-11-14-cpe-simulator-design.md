@@ -134,7 +134,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 - 前台运行，按 `--sim-ramp` 节奏启动全部 CPE；子进程异常退出时自动重启（带退避，防止崩溃死循环）。
 - 区分退出原因（实现者的决定）：目前 Reboot、FactoryReset、CLI `stop` 都以 `exit(0)` 结束（`src/core/dm_exec.c:1702-1754`）。在模拟模式（环境变量 `USP_SIM_IDX` 存在）下改为不同的退出码：Reboot = 10、FactoryReset = 11、stop = 0。非模拟模式行为不变。
   - Reboot：立即重启该 CPE，不计入异常。
-  - FactoryReset：同上；`usp.db`、`mock.db` 的清理沿用核心现有的 factory reset 流程，`mock.db` 由 supervisor 在收到退出码 11 时与 `usp.db` 一并删除，插件不负责清除。
+  - FactoryReset：同上；`mock.db` 由 supervisor 在收到退出码 11 时删除，插件不负责清除；`usp.db` 同样由 supervisor 删除。
   - stop（CLI）：该 CPE 保持停止，不再拉起。
   - 其他退出码或信号：视为崩溃，带退避重启。
 - SIGINT/SIGTERM：向所有子进程转发并等待退出。
