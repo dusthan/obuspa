@@ -23,7 +23,8 @@ CTRL_EID="Device.LocalAgent.Controller.1.EndpointID"
 
 ALL_CASES=(it_identities it_persist_reboot it_factory_reset it_stop_stays_down it_crash_restart
            it_restart_keeps_identity it_conf_mismatch it_second_supervisor_refused
-           it_no_orphans_after_sigterm it_crash_loop_backoff it_no_sim_unchanged)
+           it_bad_template_no_damage it_no_orphans_after_sigterm it_crash_loop_backoff
+           it_no_sim_unchanged)
 
 # ---------------------------------------------------------------- helpers
 # Per-case globals: T (temp dir), SIMROOT, LOG (supervisor output), SUP (current supervisor pid)
@@ -214,6 +215,32 @@ it_conf_mismatch() {
     expect_eq "Alias" "$(getv 100 Device.LocalAgent.Controller.1.Alias)" ctrl-100
     expect_eq "controller EID" "$(getv 100 $CTRL_EID)" self::ctrl-X000100
     grep -q "^sn_fmt=X%06u$" "$SIMROOT/sim.conf" || fail "sim.conf not updated"
+}
+
+# snapshot -> sorted "md5 mtime path" of every file under SIMROOT (except the lock file)
+snapshot() {
+    find "$SIMROOT" -type f ! -name sim.pid -printf '%T@ %p\n' | sort -k2 > "$T/.mtimes"
+    find "$SIMROOT" -type f ! -name sim.pid -exec md5sum {} + | sort -k2 | paste -d' ' - "$T/.mtimes"
+}
+
+it_bad_template_no_damage() {
+    start_sup --sim-per-proc 2 $(STD_ARGS)
+    wait_for "cpe 100 ready" is_ready 100
+    wait_for "cpe 101 ready" is_ready 101
+    stop_sup
+    [ -f "$(cpedir 100)/usp.db" ] && [ -f "$(cpedir 101)/usp.db" ] || fail "usp.db files missing after first run"
+    snapshot > "$T/before"
+    { head -1 "$TMPL"; echo 'Device.LocalAgent.Controller.1.EndpointID "self::${SNN}"'; } > "$T/bad_tmpl.txt"
+    sleep 1   # make any rewrite visible in mtimes
+    local rc=0
+    timeout 20 "$OBUSPA" --sim-root "$SIMROOT" --sim-per-proc 2 --sim-base 100 --sim-ramp 0 \
+        --sim-sn-fmt "X%06u" --sim-reidentify --sim-reset "$T/bad_tmpl.txt" -x "$PLUGIN" >"$T/out2" 2>"$T/err2" || rc=$?
+    expect_eq "rc with bad template" "$rc" 2
+    grep -q "bad_tmpl.txt:2 .*SNN" "$T/err2" || fail "stderr does not name line 2 / \${SNN}: $(cat "$T/err2")"
+    snapshot > "$T/after"
+    diff "$T/before" "$T/after" >"$T/snapdiff" || fail "files under sim-root changed: $(cat "$T/snapdiff")"
+    grep -q "^sn_fmt=SIM%08u$" "$SIMROOT/sim.conf" || fail "sim.conf rewritten"
+    if grep -q "^sim: launch" "$T/out2"; then fail "refused supervisor launched instances"; fi
 }
 
 it_second_supervisor_refused() {

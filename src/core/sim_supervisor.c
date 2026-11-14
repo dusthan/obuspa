@@ -2,7 +2,8 @@
  * CPE simulator: supervisor process entry point.
  *
  * Runs before USP_LOG_Init()/USP_MEM_Init() (see main.c), so it uses plain stdio and malloc only.
- * Flow: parse/validate options -> lock <root>/sim.pid -> check sim.conf -> prepare instance
+ * Flow: parse/validate options -> lock <root>/sim.pid -> compute identities and dry-run the reset
+ * template -> check sim.conf (may delete DBs) -> prepare instance
  * directories (reset.txt, sim.map) -> fork/exec/reap loop -> orderly shutdown on SIGINT/SIGTERM.
  */
 #include <dirent.h>
@@ -61,6 +62,7 @@ typedef struct
     char self[PATH_MAX];
     char pid_path[PATH_MAX];
     int lock_fd;
+    char *tmpl;              // reset template contents (NULL = none)
     sim_inst_t *inst;
     size_t count;
     sim_ramp_t ramp;
@@ -301,29 +303,22 @@ static char *ReadFile(const char *path)
     return buf;
 }
 
-// Expands the reset template line by line into <dir>/reset.txt. Returns 0, 1 (I/O) or 2 (template error).
-static int WriteResetFile(const char *tmpl_path, const char *tmpl, const sim_identity_t *id)
+// Expands the reset template line by line, writing to f (NULL = validate only).
+// Returns 0, 1 (write error) or 2 (template error, reported with file and line number).
+static int ExpandResetTemplate(const char *tmpl_path, const char *tmpl, const sim_identity_t *id, FILE *f)
 {
-    char path[PATH_MAX], err[256];
-    char line[8192], out[16384];
+    char err[256], line[8192], out[16384];
     const char *p = tmpl;
     unsigned lineno = 0;
-    int rc = 0;
-    FILE *f;
 
-    if (JoinPath(path, sizeof(path), id->dir, "reset.txt") != 0) { Err("%s/reset.txt: path too long", id->dir); return 2; }
-    f = fopen(path, "w");
-    if (f == NULL) { Err("cannot write %s: %s", path, strerror(errno)); return 1; }
-
-    while (*p != '\0' && rc == 0)
+    while (*p != '\0')
     {
         size_t len = strcspn(p, "\n");
         lineno++;
         if (len >= sizeof(line))
         {
             Err("%s:%u: line too long (max %zu chars)", tmpl_path, lineno, sizeof(line) - 1);
-            rc = 2;
-            break;
+            return 2;
         }
         memcpy(line, p, len);
         line[len] = '\0';
@@ -331,43 +326,75 @@ static int WriteResetFile(const char *tmpl_path, const char *tmpl, const sim_ide
         if (SIM_ExpandTemplate(line, id, out, sizeof(out), err, sizeof(err)) != 0)
         {
             Err("%s:%u (idx %lu): %s", tmpl_path, lineno, id->idx, err);
-            rc = 2;
-            break;
+            return 2;
         }
-        if (fprintf(f, "%s\n", out) < 0) rc = 1;
+        if (f != NULL && fprintf(f, "%s\n", out) < 0) return 1;
     }
+    return 0;
+}
+
+static int WriteResetFile(const sim_ctx_t *ctx, const sim_identity_t *id)
+{
+    char path[PATH_MAX];
+    FILE *f;
+    int rc;
+
+    if (JoinPath(path, sizeof(path), id->dir, "reset.txt") != 0) { Err("%s/reset.txt: path too long", id->dir); return 2; }
+    f = fopen(path, "w");
+    if (f == NULL) { Err("cannot write %s: %s", path, strerror(errno)); return 1; }
+    rc = ExpandResetTemplate(ctx->cfg.reset_tmpl, ctx->tmpl, id, f);
     if (fclose(f) != 0 && rc == 0) rc = 1;
     if (rc == 1) Err("cannot write %s: %s", path, strerror(errno));
     return rc;
 }
 
-static int PrepareInstances(sim_ctx_t *ctx)
+// Computes every identity and dry-runs the reset template for each, before anything on disk is changed.
+// Returns 0, 1 (runtime error) or 2 (configuration error).
+static int ValidateInstances(sim_ctx_t *ctx)
 {
-    char err[512], map_path[PATH_MAX], tmp_path[PATH_MAX];
-    char *tmpl = NULL;
-    FILE *map;
-    int rc = 0;
+    char err[512];
 
     ctx->count = (size_t)ctx->cfg.procs * ctx->cfg.per_proc;
     ctx->inst = calloc(ctx->count, sizeof(sim_inst_t));
     if (ctx->inst == NULL) { Err("out of memory for %zu instances", ctx->count); return 1; }
 
-    if (ctx->cfg.reset_tmpl[0] != '\0' && (tmpl = ReadFile(ctx->cfg.reset_tmpl)) == NULL)
+    if (ctx->cfg.reset_tmpl[0] != '\0' && (ctx->tmpl = ReadFile(ctx->cfg.reset_tmpl)) == NULL)
     {
         Err("cannot read reset template %s: %s", ctx->cfg.reset_tmpl, strerror(errno));
         return 2;
     }
+    for (size_t i = 0; i < ctx->count; i++)
+    {
+        sim_inst_t *in = &ctx->inst[i];
+        unsigned proc = (unsigned)(i / ctx->cfg.per_proc), inst = (unsigned)(i % ctx->cfg.per_proc);
+        if (SIM_MakeIdentity(&ctx->cfg, proc, inst, &in->id, err, sizeof(err)) != 0)
+        {
+            Err("instance proc=%u inst=%u: %s", proc, inst, err);
+            return 2;
+        }
+        if (ctx->tmpl != NULL && ExpandResetTemplate(ctx->cfg.reset_tmpl, ctx->tmpl, &in->id, NULL) != 0) return 2;
+        in->state = INST_PENDING;
+        in->pid = -1;
+    }
+    return 0;
+}
+
+// Creates the instance directories, writes reset.txt for each and sim.map (via tmp + rename)
+static int PrepareInstances(sim_ctx_t *ctx)
+{
+    char map_path[PATH_MAX], tmp_path[PATH_MAX];
+    FILE *map;
+    int rc = 0;
+
     if (JoinPath(map_path, sizeof(map_path), ctx->cfg.root, "sim.map") != 0 ||
         JoinPath(tmp_path, sizeof(tmp_path), ctx->cfg.root, "sim.map.tmp") != 0)
     {
-        free(tmpl);
         Err("sim-root path is too long");
         return 2;
     }
     map = fopen(tmp_path, "w");
     if (map == NULL)
     {
-        free(tmpl);
         Err("cannot write %s: %s", tmp_path, strerror(errno));
         return 1;
     }
@@ -375,26 +402,16 @@ static int PrepareInstances(sim_ctx_t *ctx)
 
     for (size_t i = 0; i < ctx->count && rc == 0; i++)
     {
-        sim_inst_t *in = &ctx->inst[i];
-        unsigned proc = (unsigned)(i / ctx->cfg.per_proc), inst = (unsigned)(i % ctx->cfg.per_proc);
-        if (SIM_MakeIdentity(&ctx->cfg, proc, inst, &in->id, err, sizeof(err)) != 0)
+        const sim_identity_t *id = &ctx->inst[i].id;
+        if (mkdir(id->dir, 0755) != 0 && errno != EEXIST)
         {
-            Err("instance proc=%u inst=%u: %s", proc, inst, err);
-            rc = 2;
-            break;
-        }
-        if (mkdir(in->id.dir, 0755) != 0 && errno != EEXIST)
-        {
-            Err("cannot create %s: %s", in->id.dir, strerror(errno));
+            Err("cannot create %s: %s", id->dir, strerror(errno));
             rc = 1;
             break;
         }
-        if (tmpl != NULL) rc = WriteResetFile(ctx->cfg.reset_tmpl, tmpl, &in->id);
-        SIM_MapWriteRow(map, &in->id);
-        in->state = INST_PENDING;
-        in->pid = -1;
+        if (ctx->tmpl != NULL) rc = WriteResetFile(ctx, id);
+        SIM_MapWriteRow(map, id);
     }
-    free(tmpl);
 
     if (fclose(map) != 0 && rc == 0)
     {
@@ -769,6 +786,7 @@ int SIM_Main(int argc, char **argv)
 
     rc = LoadConfig(ctx, argc, argv);
     if (rc == 0) rc = AcquireLock(ctx);
+    if (rc == 0) rc = ValidateInstances(ctx);   // before any destructive step
     if (rc == 0) rc = CheckSimConf(ctx);
     if (rc == 0) rc = PrepareInstances(ctx);
     if (rc == 0) rc = ResolveSelf(ctx, argv[0]);
@@ -780,6 +798,7 @@ int SIM_Main(int argc, char **argv)
     }
 
     ReleaseLock(ctx);
+    free(ctx->tmpl);
     free(ctx->inst);
     free(ctx->fwd);
     free(ctx);
