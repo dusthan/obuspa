@@ -19,7 +19,8 @@ test/                        Host test harness (stubs the USP API)
 
 ## Build (Linux)
 
-Dependencies: `gcc`, `make`, OpenSSL headers (Debian/Ubuntu `libssl-dev`, RHEL/Fedora `openssl-devel`, Alpine `openssl-dev`).
+Dependencies: `gcc`, `make`, OpenSSL headers (Debian/Ubuntu `libssl-dev`, RHEL/Fedora `openssl-devel`, Alpine `openssl-dev`)
+and sqlite3 (`libsqlite3-dev` / `sqlite-devel` / `sqlite-dev`; the mock backend links `-lsqlite3`, override with `LIBS=`).
 Python 3 is only needed by `make gen`. The obuspa source tree must be at `../..`, otherwise set `OBUSPA_SRC=`.
 
 ```sh
@@ -52,6 +53,25 @@ make install-strip DESTDIR=$ROOTFS
 - The `.so` exports only `VENDOR_Init/Start/Stop` (`-fvisibility=hidden` + `exports.map`), so its internal symbols cannot clash with obuspa's.
 - `USP_*` symbols are left undefined on purpose and resolved from obuspa when it is loaded, so do not add `-Wl,-z,defs` / `--no-undefined`.
 - `make test` always uses `HOSTCC` (default `cc`), so it still runs on the build machine when cross-compiling.
+
+## Persistence and per-CPE identity (mock backend)
+
+By default the mock backend is pure memory: writes are lost when obuspa exits. If the environment variable
+`TR181_MOCK_DB` names a file (e.g. `<dir>/mock.db`), every Set / AddInstance / DeleteInstance is also written to
+that sqlite database (tables `kv` and `inst`, WAL mode), and replayed over the seeds at the next start
+(order: seeds, identity rewrite, instance adds/deletes, value overrides). If the database cannot be opened,
+the plug-in fails to initialise. On FactoryReset the user (or the simulator supervisor) must delete that file;
+the plug-in does not do it.
+
+The seeds can be rewritten per CPE through environment variables (unset = no rewrite):
+
+| Variable | Effect |
+|---|---|
+| `USP_BOARD_SERIAL` | `Device.DeviceInfo.SerialNumber`, `DeviceID.SerialNumber` |
+| `USP_BOARD_OUI` | `Device.DeviceInfo.ManufacturerOUI` |
+| `USP_SIM_MAC` (`02:00:00:00:07:00`) | every seed path ending in `MACAddress` whose value is a MAC: first 5 bytes of `USP_SIM_MAC` + the seed's last byte |
+
+The rewrite only applies to seeds; a later persisted Set of a MACAddress keeps the user's value.
 
 ## Run
 

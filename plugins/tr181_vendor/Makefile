@@ -66,6 +66,9 @@ CFLAGS        ?= -O2 -g
 CPPFLAGS      ?=
 LDFLAGS       ?=
 
+# Libraries: the mock backend persists to sqlite (Debian/Ubuntu libsqlite3-dev, RHEL/Fedora sqlite-devel, Alpine sqlite-dev)
+LIBS          ?= -lsqlite3
+
 #------------------------------------------------------------------------------
 # Derived settings
 
@@ -119,7 +122,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS) exports.map
 	@echo "  LD      $@"
-	$(Q)$(CC) $(SYSROOT_FLAGS) $(REQ_LDFLAGS) $(LDFLAGS) -o $@ $(OBJS)
+	$(Q)$(CC) $(SYSROOT_FLAGS) $(REQ_LDFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
 src/%.o: src/%.c
 	@echo "  CC      $<"
@@ -137,7 +140,7 @@ test: $(TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRCS) $(wildcard src/*.h test/*.h)
 	@echo "  HOSTCC  $@"
-	$(Q)$(HOSTCC) -std=gnu99 -D_GNU_SOURCE $(PLUGIN_DEFS) $(WARN_FLAGS) $(INCLUDES) $(HOST_OPENSSL_CFLAGS) -O1 -g -o $@ $(TEST_SRCS)
+	$(Q)$(HOSTCC) -std=gnu99 -D_GNU_SOURCE $(PLUGIN_DEFS) $(WARN_FLAGS) $(INCLUDES) $(HOST_OPENSSL_CFLAGS) -O1 -g -o $@ $(TEST_SRCS) $(LIBS)
 
 # Verify the .so exports only the VENDOR_* entry points, and list what it expects from obuspa
 check: test $(TARGET)
@@ -165,6 +168,7 @@ env:
 	@echo "OPENSSL_CFLAGS = $(OPENSSL_CFLAGS)"
 	@echo "CFLAGS         = $(CFLAGS)"
 	@echo "LDFLAGS        = $(LDFLAGS)"
+	@echo "LIBS           = $(LIBS)"
 	@printf '#include <openssl/ssl.h>\n' | $(CC) $(SYSROOT_FLAGS) $(OPENSSL_CFLAGS) -E -x c - >/dev/null 2>&1 \
 		&& echo "openssl/ssl.h  = found" \
 		|| echo "openssl/ssl.h  = NOT FOUND (install libssl-dev / openssl-devel, or set OPENSSL_CFLAGS)"

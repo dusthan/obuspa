@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include "tr181_backend.h"
 
 #include "usp_err_codes.h"
 #include "vendor_api.h"
@@ -171,6 +175,186 @@ static void ExpectGet(const char *path, const char *expected)
     CHECK((err == USP_ERR_OK) && (strcmp(buf, expected) == 0), "Get %s = '%s' (err %d), expected '%s'", path, buf, err, expected);
 }
 
+//------------------------------------------------------------------------------
+// Mock backend: identity rewrite and sqlite persistence (backend API used directly)
+static void ClearSimEnv(void)
+{
+    unsetenv("USP_BOARD_SERIAL");
+    unsetenv("USP_BOARD_OUI");
+    unsetenv("USP_SIM_MAC");
+    unsetenv("TR181_MOCK_DB");
+}
+
+static void BeExpect(const char *path, const char *expected)
+{
+    char buf[MAX_DM_VALUE_LEN] = "";
+    int err = TR181_BE_Get(path, buf, sizeof(buf));
+    CHECK((err == TR181_BE_OK) && (strcmp(buf, expected) == 0), "BE_Get %s = '%s' (err %d), expected '%s'", path, buf, err, expected);
+}
+
+static bool BeHasInstance(const char *table_prefix, int inst)
+{
+    int insts[64];
+    int num = 0;
+    int i;
+    TR181_BE_GetInstances(table_prefix, insts, 64, &num);
+    for (i=0; i < num; i++)
+    {
+        if (insts[i] == inst)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Creates a unique temp file path (the empty file is valid input for sqlite)
+static void TempDbPath(char *path, size_t len)
+{
+    int fd;
+    snprintf(path, len, "/tmp/tr181_mock_XXXXXX");
+    fd = mkstemp(path);
+    CHECK(fd >= 0, "mkstemp failed");
+    if (fd >= 0)
+    {
+        close(fd);
+    }
+}
+
+static void RemoveDb(const char *path)
+{
+    char aux[600];
+    unlink(path);
+    snprintf(aux, sizeof(aux), "%s-wal", path);
+    unlink(aux);
+    snprintf(aux, sizeof(aux), "%s-shm", path);
+    unlink(aux);
+}
+
+static void test_mock_identity_rewrite(void)
+{
+    ClearSimEnv();
+    setenv("USP_BOARD_SERIAL", "SIM00000007", 1);
+    setenv("USP_BOARD_OUI", "ABCDEF", 1);
+    setenv("USP_SIM_MAC", "02:00:00:00:07:00", 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "identity: Init failed");
+    BeExpect("Device.DeviceInfo.SerialNumber", "SIM00000007");
+    BeExpect("Device.DeviceInfo.ManufacturerOUI", "ABCDEF");
+    BeExpect("Device.Ethernet.Interface.1.MACAddress", "02:00:00:00:07:53");
+    BeExpect("Device.WiFi.SSID.1.MACAddress", "02:00:00:00:07:50");
+    BeExpect("Device.WiFi.AccessPoint.2.AssociatedDevice.1.MACAddress", "02:00:00:00:07:02");
+    TR181_BE_Stop();
+    ClearSimEnv();
+}
+
+static void test_mock_no_env_unchanged(void)
+{
+    ClearSimEnv();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "no_env: Init failed");
+    BeExpect("Device.DeviceInfo.SerialNumber", "C100023710001066");
+    BeExpect("Device.Ethernet.Interface.1.MACAddress", "7C:45:D0:33:55:53");
+    TR181_BE_Stop();
+}
+
+static void test_mock_persist_set(void)
+{
+    char db[256];
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "persist_set: Init failed");
+    CHECK(TR181_BE_Set("Device.WiFi.SSID.1.SSID", "abc") == TR181_BE_OK, "persist_set: Set failed");
+    TR181_BE_Stop();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "persist_set: re-Init failed");
+    BeExpect("Device.WiFi.SSID.1.SSID", "abc");
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
+static void test_mock_persist_add_delete(void)
+{
+    char db[256];
+    char buf[64];
+    const char *tbl = "Device.Hosts.AccessControl.";
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "add_delete: Init failed");
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.5") == TR181_BE_OK, "add_delete: Add failed");
+    CHECK(TR181_BE_Set("Device.Hosts.AccessControl.5.HostName", "new_pc%1") == TR181_BE_OK, "add_delete: Set failed");
+    TR181_BE_Stop();
+
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "add_delete: re-Init 1 failed");
+    CHECK(BeHasInstance(tbl, 5), "add_delete: instance 5 lost");
+    BeExpect("Device.Hosts.AccessControl.5.HostName", "new_pc%1");
+    CHECK(TR181_BE_DeleteInstance("Device.Hosts.AccessControl.5") == TR181_BE_OK, "add_delete: Delete failed");
+    TR181_BE_Stop();
+
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "add_delete: re-Init 2 failed");
+    CHECK(!BeHasInstance(tbl, 5), "add_delete: instance 5 still present");
+    CHECK(TR181_BE_Get("Device.Hosts.AccessControl.5.HostName", buf, sizeof(buf)) == TR181_BE_NOT_FOUND, "add_delete: value survived delete");
+    CHECK(BeHasInstance(tbl, 4), "add_delete: instance 4 lost");
+    BeExpect("Device.Hosts.AccessControl.4.HostName", "test-PC4");
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
+static void test_mock_persist_delete_seed(void)
+{
+    char db[256];
+    char buf[64];
+    const char *tbl = "Device.Hosts.AccessControl.";
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "delete_seed: Init failed");
+    CHECK(BeHasInstance(tbl, 2), "delete_seed: seed instance 2 missing");
+    CHECK(TR181_BE_DeleteInstance("Device.Hosts.AccessControl.2") == TR181_BE_OK, "delete_seed: Delete failed");
+    TR181_BE_Stop();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "delete_seed: re-Init failed");
+    CHECK(!BeHasInstance(tbl, 2), "delete_seed: instance 2 came back");
+    CHECK(TR181_BE_Get("Device.Hosts.AccessControl.2.HostName", buf, sizeof(buf)) == TR181_BE_NOT_FOUND, "delete_seed: seed value came back");
+    CHECK(BeHasInstance(tbl, 3), "delete_seed: instance 3 lost");
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
+static void test_mock_no_db_memory_only(void)
+{
+    struct stat st;
+    ClearSimEnv();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "memory_only: Init failed");
+    CHECK(TR181_BE_Set("Device.WiFi.SSID.1.SSID", "abc") == TR181_BE_OK, "memory_only: Set failed");
+    TR181_BE_Stop();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "memory_only: re-Init failed");
+    BeExpect("Device.WiFi.SSID.1.SSID", "CPE-C201-TEST4-5G");
+    TR181_BE_Stop();
+    CHECK(stat("mock.db", &st) != 0, "memory_only: unexpected file mock.db created");
+}
+
+static void test_mock_persist_open_failure(void)
+{
+    ClearSimEnv();
+    setenv("TR181_MOCK_DB", "/nonexistent_dir_tr181/mock.db", 1);
+    CHECK(TR181_BE_Init() == TR181_BE_ERROR, "open_failure: Init should fail");
+    TR181_BE_Stop();
+    ClearSimEnv();
+}
+
+static void RunMockTests(void)
+{
+    test_mock_identity_rewrite();
+    test_mock_no_env_unchanged();
+    test_mock_persist_set();
+    test_mock_persist_add_delete();
+    test_mock_persist_delete_seed();
+    test_mock_no_db_memory_only();
+    test_mock_persist_open_failure();
+}
+
 int main(void)
 {
     int err;
@@ -302,6 +486,8 @@ int main(void)
     }
 
     VENDOR_Stop();
+
+    RunMockTests();
 
     if (failures == 0)
     {

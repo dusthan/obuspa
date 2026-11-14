@@ -2,7 +2,14 @@
  * tr181_backend_mock.c
  *
  * In-memory implementation of tr181_backend.h, seeded from the values in data/tr181_params.csv.
- * Writes are kept in RAM only (lost when obuspa restarts).
+ * Writes are kept in RAM only (lost when obuspa restarts), unless the environment variable
+ * TR181_MOCK_DB names a sqlite file, in which case every Set/Add/Delete is also persisted there
+ * and replayed over the seeds at the next TR181_BE_Init().
+ *
+ * Per-CPE identity (set by the simulator supervisor) is applied to the seeds:
+ *   USP_BOARD_SERIAL -> DeviceInfo.SerialNumber / DeviceID.SerialNumber
+ *   USP_BOARD_OUI    -> DeviceInfo.ManufacturerOUI
+ *   USP_SIM_MAC      -> every *MACAddress seed: first 5 bytes of USP_SIM_MAC + the seed's last byte
  *
  * Replace this file with a platform implementation to talk to the real device.
  */
@@ -11,6 +18,10 @@
 #include <string.h>
 #include <ctype.h>
 
+#include <sqlite3.h>
+
+#include "vendor_api.h"
+#include "usp_api.h"
 #include "tr181_backend.h"
 #include "tr181_dm.h"
 
@@ -34,7 +45,25 @@ static int num_instances = 0;
 static int max_instances = 0;
 
 //------------------------------------------------------------------------------
+// Optional sqlite persistence (only when TR181_MOCK_DB is set)
+static sqlite3 *db = NULL;
+static sqlite3_stmt *stmt_set = NULL;
+static sqlite3_stmt *stmt_inst = NULL;
+static sqlite3_stmt *stmt_del_kv = NULL;
+
+//------------------------------------------------------------------------------
 // Forward declarations
+static void ApplyIdentity(void);
+static bool ParseMac(const char *s, unsigned char mac[6]);
+static int OpenDb(const char *file);
+static void CloseDb(void);
+static int ReplayDb(void);
+static int DbExec(const char *sql);
+static int DbStep(sqlite3_stmt *st, const char *what);
+static int DbSetValue(const char *path, const char *value);
+static int DbSetInstance(const char *obj_path, int present);
+static int RemoveInstance(const char *obj_path);
+static bool EndsWith(const char *s, const char *suffix);
 static unsigned Hash(const char *s);
 static kv_entry_t *FindEntry(const char *path);
 static int StoreValue(const char *path, const char *value);
@@ -45,6 +74,7 @@ static int CompareInt(const void *a, const void *b);
 int TR181_BE_Init(void)
 {
     int i;
+    const char *db_file;
 
     for (i=0; i < tr181_num_seed_instances; i++)
     {
@@ -62,6 +92,18 @@ int TR181_BE_Init(void)
         }
     }
 
+    ApplyIdentity();
+
+    db_file = getenv("TR181_MOCK_DB");
+    if ((db_file != NULL) && (db_file[0] != '\0'))
+    {
+        if ((OpenDb(db_file) != TR181_BE_OK) || (ReplayDb() != TR181_BE_OK))
+        {
+            CloseDb();
+            return TR181_BE_ERROR;
+        }
+    }
+
     return TR181_BE_OK;
 }
 
@@ -70,6 +112,8 @@ void TR181_BE_Stop(void)
     int i;
     kv_entry_t *e;
     kv_entry_t *next;
+
+    CloseDb();
 
     for (i=0; i < NUM_BUCKETS; i++)
     {
@@ -109,7 +153,11 @@ int TR181_BE_Get(const char *path, char *buf, int len)
 
 int TR181_BE_Set(const char *path, const char *value)
 {
-    return StoreValue(path, value);
+    if (StoreValue(path, value) != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+    return DbSetValue(path, value);
 }
 
 int TR181_BE_GetInstances(const char *table_prefix, int *insts, int max, int *num)
@@ -153,10 +201,25 @@ int TR181_BE_GetInstances(const char *table_prefix, int *insts, int max, int *nu
 
 int TR181_BE_AddInstance(const char *obj_path)
 {
-    return AddInstancePath(obj_path);
+    if (AddInstancePath(obj_path) != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+    return DbSetInstance(obj_path, 1);
 }
 
 int TR181_BE_DeleteInstance(const char *obj_path)
+{
+    if (RemoveInstance(obj_path) != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+    return DbSetInstance(obj_path, 0);
+}
+
+//------------------------------------------------------------------------------
+// Removes an instance, its child instances and all parameter values below it (memory only)
+static int RemoveInstance(const char *obj_path)
 {
     int i;
     int j;
@@ -204,6 +267,296 @@ int TR181_BE_DeleteInstance(const char *obj_path)
     }
 
     return TR181_BE_OK;
+}
+
+//------------------------------------------------------------------------------
+// Identity rewrite of the seeds
+
+static bool ParseMac(const char *s, unsigned char mac[6])
+{
+    int i;
+    unsigned v;
+
+    if (strlen(s) != 17)
+    {
+        return false;
+    }
+    for (i=0; i < 6; i++)
+    {
+        if (!isxdigit((unsigned char)s[i*3]) || !isxdigit((unsigned char)s[i*3+1]))
+        {
+            return false;
+        }
+        if ((i < 5) && (s[i*3+2] != ':'))
+        {
+            return false;
+        }
+        if (sscanf(&s[i*3], "%2x", &v) != 1)
+        {
+            return false;
+        }
+        mac[i] = (unsigned char)v;
+    }
+    return true;
+}
+
+static void ApplyIdentity(void)
+{
+    const char *serial = getenv("USP_BOARD_SERIAL");
+    const char *oui = getenv("USP_BOARD_OUI");
+    const char *sim_mac = getenv("USP_SIM_MAC");
+    unsigned char base[6];
+    unsigned char orig[6];
+    bool have_mac = false;
+    char buf[32];
+    int i;
+
+    if ((serial != NULL) && (serial[0] != '\0'))
+    {
+        if (FindEntry("Device.DeviceInfo.SerialNumber") != NULL)
+        {
+            StoreValue("Device.DeviceInfo.SerialNumber", serial);
+        }
+        if (FindEntry("DeviceID.SerialNumber") != NULL)
+        {
+            StoreValue("DeviceID.SerialNumber", serial);
+        }
+    }
+    if ((oui != NULL) && (oui[0] != '\0') && (FindEntry("Device.DeviceInfo.ManufacturerOUI") != NULL))
+    {
+        StoreValue("Device.DeviceInfo.ManufacturerOUI", oui);
+    }
+
+    if ((sim_mac != NULL) && ParseMac(sim_mac, base))
+    {
+        have_mac = true;
+    }
+    else if ((sim_mac != NULL) && (sim_mac[0] != '\0'))
+    {
+        USP_LOG_Warning("%s: ignoring malformed USP_SIM_MAC '%s'", __func__, sim_mac);
+    }
+    if (!have_mac)
+    {
+        return;
+    }
+
+    for (i=0; i < tr181_num_seed_values; i++)
+    {
+        if (EndsWith(tr181_seed_values[i].path, "MACAddress") && ParseMac(tr181_seed_values[i].value, orig))
+        {
+            snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     base[0], base[1], base[2], base[3], base[4], orig[5]);
+            StoreValue(tr181_seed_values[i].path, buf);
+        }
+    }
+}
+
+static bool EndsWith(const char *s, const char *suffix)
+{
+    size_t ls = strlen(s);
+    size_t lx = strlen(suffix);
+    return (ls >= lx) && (strcmp(&s[ls - lx], suffix) == 0);
+}
+
+//------------------------------------------------------------------------------
+// sqlite persistence
+
+static int DbExec(const char *sql)
+{
+    char *msg = NULL;
+
+    if (sqlite3_exec(db, sql, NULL, NULL, &msg) != SQLITE_OK)
+    {
+        USP_LOG_Error("%s: sqlite error executing '%s': %s", __func__, sql, (msg != NULL) ? msg : "?");
+        sqlite3_free(msg);
+        return TR181_BE_ERROR;
+    }
+    return TR181_BE_OK;
+}
+
+static int Prepare(sqlite3_stmt **st, const char *sql)
+{
+    if (sqlite3_prepare_v2(db, sql, -1, st, NULL) != SQLITE_OK)
+    {
+        USP_LOG_Error("%s: sqlite prepare failed (%s): %s", __func__, sql, sqlite3_errmsg(db));
+        return TR181_BE_ERROR;
+    }
+    return TR181_BE_OK;
+}
+
+static int OpenDb(const char *file)
+{
+    if (sqlite3_open(file, &db) != SQLITE_OK)
+    {
+        USP_LOG_Error("%s: cannot open TR181_MOCK_DB '%s': %s", __func__, file, (db != NULL) ? sqlite3_errmsg(db) : "out of memory");
+        return TR181_BE_ERROR;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    if ((DbExec("PRAGMA journal_mode=WAL") != TR181_BE_OK) ||
+        (DbExec("PRAGMA synchronous=NORMAL") != TR181_BE_OK) ||
+        (DbExec("CREATE TABLE IF NOT EXISTS kv(path TEXT PRIMARY KEY, value TEXT)") != TR181_BE_OK) ||
+        (DbExec("CREATE TABLE IF NOT EXISTS inst(path TEXT PRIMARY KEY, present INTEGER)") != TR181_BE_OK))
+    {
+        return TR181_BE_ERROR;
+    }
+
+    if ((Prepare(&stmt_set, "INSERT OR REPLACE INTO kv(path, value) VALUES(?1, ?2)") != TR181_BE_OK) ||
+        (Prepare(&stmt_inst, "INSERT OR REPLACE INTO inst(path, present) VALUES(?1, ?2)") != TR181_BE_OK) ||
+        (Prepare(&stmt_del_kv, "DELETE FROM kv WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'") != TR181_BE_OK))
+    {
+        return TR181_BE_ERROR;
+    }
+    return TR181_BE_OK;
+}
+
+static void CloseDb(void)
+{
+    sqlite3_finalize(stmt_set);
+    sqlite3_finalize(stmt_inst);
+    sqlite3_finalize(stmt_del_kv);
+    stmt_set = stmt_inst = stmt_del_kv = NULL;
+    if (db != NULL)
+    {
+        sqlite3_close(db);
+        db = NULL;
+    }
+}
+
+static int ReplayDb(void)
+{
+    sqlite3_stmt *st = NULL;
+    int rc;
+    int err = TR181_BE_OK;
+
+    // Instances first (present=0 also removes the values and sub-instances below it)
+    if (Prepare(&st, "SELECT path, present FROM inst ORDER BY rowid") != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+    {
+        const char *path = (const char *)sqlite3_column_text(st, 0);
+        int present = sqlite3_column_int(st, 1);
+
+        if (path == NULL)
+        {
+            continue;
+        }
+        err = present ? AddInstancePath(path) : RemoveInstance(path);
+        if (err != TR181_BE_OK)
+        {
+            break;
+        }
+    }
+    if ((err == TR181_BE_OK) && (rc != SQLITE_DONE))
+    {
+        USP_LOG_Error("%s: sqlite error reading inst table: %s", __func__, sqlite3_errmsg(db));
+        err = TR181_BE_ERROR;
+    }
+    sqlite3_finalize(st);
+    if (err != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+
+    // Then the value overrides
+    st = NULL;
+    if (Prepare(&st, "SELECT path, value FROM kv") != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+    {
+        const char *path = (const char *)sqlite3_column_text(st, 0);
+        const char *value = (const char *)sqlite3_column_text(st, 1);
+
+        if (path == NULL)
+        {
+            continue;
+        }
+        err = StoreValue(path, (value != NULL) ? value : "");
+        if (err != TR181_BE_OK)
+        {
+            break;
+        }
+    }
+    if ((err == TR181_BE_OK) && (rc != SQLITE_DONE))
+    {
+        USP_LOG_Error("%s: sqlite error reading kv table: %s", __func__, sqlite3_errmsg(db));
+        err = TR181_BE_ERROR;
+    }
+    sqlite3_finalize(st);
+    return err;
+}
+
+static int DbStep(sqlite3_stmt *st, const char *what)
+{
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
+    if (rc != SQLITE_DONE)
+    {
+        USP_LOG_Error("%s: sqlite %s failed: %s", __func__, what, sqlite3_errmsg(db));
+        return TR181_BE_ERROR;
+    }
+    return TR181_BE_OK;
+}
+
+static int DbSetValue(const char *path, const char *value)
+{
+    if (db == NULL)
+    {
+        return TR181_BE_OK;
+    }
+    sqlite3_bind_text(stmt_set, 1, path, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt_set, 2, value, -1, SQLITE_STATIC);
+    return DbStep(stmt_set, "kv write");
+}
+
+static int DbSetInstance(const char *obj_path, int present)
+{
+    char *pattern;
+    size_t i;
+    size_t n = 0;
+    int err;
+
+    if (db == NULL)
+    {
+        return TR181_BE_OK;
+    }
+
+    sqlite3_bind_text(stmt_inst, 1, obj_path, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt_inst, 2, present);
+    err = DbStep(stmt_inst, "inst write");
+    if ((err != TR181_BE_OK) || present)
+    {
+        return err;
+    }
+
+    // Deleted: drop persisted values at and below the instance (escape LIKE wildcards in the path)
+    pattern = malloc(strlen(obj_path) * 2 + 3);
+    if (pattern == NULL)
+    {
+        return TR181_BE_ERROR;
+    }
+    for (i=0; obj_path[i] != '\0'; i++)
+    {
+        if ((obj_path[i] == '%') || (obj_path[i] == '_') || (obj_path[i] == '\\'))
+        {
+            pattern[n++] = '\\';
+        }
+        pattern[n++] = obj_path[i];
+    }
+    pattern[n++] = '.';
+    pattern[n++] = '%';
+    pattern[n] = '\0';
+
+    sqlite3_bind_text(stmt_del_kv, 1, obj_path, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt_del_kv, 2, pattern, -1, SQLITE_STATIC);
+    err = DbStep(stmt_del_kv, "kv delete");
+    free(pattern);
+    return err;
 }
 
 //------------------------------------------------------------------------------
