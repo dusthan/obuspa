@@ -23,3 +23,6 @@ ylwrap
 *.m4
 .dirstamp
 *.swp
+
+# CPE simulator Linux build output (test/sim/docker/run.sh)
+/build-linux/
