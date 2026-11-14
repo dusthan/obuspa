@@ -24,6 +24,10 @@ check_symbol_exists(mallinfo malloc.h HAVE_MALLINFO)
 add_library(core
     mtp_exec.c
     dm_exec.c
+    sim_identity.c
+    sim_args.c
+    sim_policy.c
+    sim_supervisor.c
     bdc_exec.c
     stomp.c
     socket_set.c

@@ -55,6 +55,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <pthread.h>
 
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
@@ -69,6 +70,10 @@
 //------------------------------------------------------------------------------------
 // File to send logging output to
 static FILE *log_fd;
+
+// CPE simulator log tag prefix (from USP_SIM_TAG), read once. Empty if not running as a simulator instance
+static pthread_once_t sim_log_tag_once = PTHREAD_ONCE_INIT;
+static char sim_log_tag[64];
 
 //------------------------------------------------------------------------------------
 // Global variables controlling logging
@@ -542,6 +547,27 @@ int LogLevelToSyslogSeverity(log_level_t log_level)
 
 /*********************************************************************//**
 **
+** InitSimLogTag
+**
+** Reads the CPE simulator log tag (USP_SIM_TAG) from the environment. Called once, via pthread_once()
+**
+** \param   None
+**
+** \return  None
+**
+**************************************************************************/
+static void InitSimLogTag(void)
+{
+    const char *tag = getenv("USP_SIM_TAG");
+
+    if ((tag != NULL) && (*tag != '\0'))
+    {
+        USP_STRNCPY(sim_log_tag, tag, sizeof(sim_log_tag));
+    }
+}
+
+/*********************************************************************//**
+**
 ** LogMessageToFile
 **
 ** Logs the specified message to the specified file
@@ -558,6 +584,9 @@ void LogMessageToFile(log_level_t log_level, FILE *fd, const char *str)
 {
     log_message_cb_t log_message_cb;
 
+    // Determine the (optional) CPE simulator log tag prefix
+    pthread_once(&sim_log_tag_once, InitSimLogTag);
+
     // Output to log file/stdout or syslog if none specified
     if (fd == NULL)
     {
@@ -566,11 +595,25 @@ void LogMessageToFile(log_level_t log_level, FILE *fd, const char *str)
 #else
         const int syslog_level = LogLevelToSyslogSeverity(log_level);
 #endif
-        syslog(syslog_level, "%s", str);
+        if (sim_log_tag[0] != '\0')
+        {
+            syslog(syslog_level, "[%s] %s", sim_log_tag, str);
+        }
+        else
+        {
+            syslog(syslog_level, "%s", str);
+        }
     }
     else
     {
-        fprintf(fd, "%s\n", str);
+        if (sim_log_tag[0] != '\0')
+        {
+            fprintf(fd, "[%s] %s\n", sim_log_tag, str);
+        }
+        else
+        {
+            fprintf(fd, "%s\n", str);
+        }
         fflush(fd);
     }
 

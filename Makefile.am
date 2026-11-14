@@ -29,6 +29,10 @@ OBUSPA_LOCAL_STATE_DIR = "$(localstatedir)/obuspa"
 SOURCES = src/core/main.c \
                     src/core/mtp_exec.c \
                     src/core/dm_exec.c \
+                    src/core/sim_identity.c \
+                    src/core/sim_args.c \
+                    src/core/sim_policy.c \
+                    src/core/sim_supervisor.c \
                     src/core/bdc_exec.c \
                     src/core/stomp.c \
                     src/core/socket_set.c \
@@ -160,6 +164,10 @@ private_core_include_HEADERS = \
     src/core/dllist.h \
     src/core/dm_access.h \
     src/core/dm_exec.h \
+    src/core/sim_identity.h \
+    src/core/sim_args.h \
+    src/core/sim_policy.h \
+    src/core/sim_supervisor.h \
     src/core/dm_inst_vector.h \
     src/core/dm_trans.h \
     src/core/e2e_context.h \

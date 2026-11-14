@@ -69,6 +69,8 @@
 #include "nu_macaddr.h"
 #include "plugin.h"
 #include "version.h"
+#include "sim_args.h"
+#include "sim_supervisor.h"
 
 
 #ifdef ENABLE_WEBSOCKETS
@@ -203,6 +205,12 @@ int main(int argc, char *argv[])
 
     // Determine a handle for the data model thread (this thread)
     OS_UTILS_SetDataModelThread();
+
+    // Run as the CPE simulator supervisor, if requested
+    if (SIM_IsRequested(argc, argv))
+    {
+        return SIM_Main(argc, argv);
+    }
 
     // Exit if unable to initialise basic subsystems
     USP_LOG_Init();

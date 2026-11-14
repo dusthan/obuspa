@@ -74,6 +74,7 @@
 #include "usp_broker.h"
 #include "se_cache.h"
 #include "bdc_exec.h"
+#include "sim_policy.h"
 
 #if defined(E2ESESSION_EXPERIMENTAL_USP_V_1_2)
 #include "e2e_context.h"
@@ -1688,6 +1689,39 @@ void DM_EXEC_FreeMTPConnection(mtp_conn_t *mtp)
 
 /*********************************************************************//**
 **
+** SimExitCode
+**
+** Determines the process exit code for the scheduled exit action
+** The exit code is only differentiated when running as a CPE simulator instance (USP_SIM_IDX is set),
+** so that the simulator supervisor can tell stop, reboot and factory reset apart
+**
+** \param   a - exit action which was scheduled
+**
+** \return  exit code for the process
+**
+**************************************************************************/
+static int SimExitCode(exit_action_t a)
+{
+    if (getenv("USP_SIM_IDX") == NULL)
+    {
+        return 0;
+    }
+
+    switch (a)
+    {
+        case kExitAction_Reboot:
+            return SIM_EXIT_REBOOT;
+
+        case kExitAction_FactoryReset:
+            return SIM_EXIT_FACTORY_RESET;
+
+        default:
+            return SIM_EXIT_STOP;
+    }
+}
+
+/*********************************************************************//**
+**
 ** DM_EXEC_HandleScheduledExit
 **
 ** If this function is called, then USP Agent will stop running in this function
@@ -1751,7 +1785,7 @@ void DM_EXEC_HandleScheduledExit(void)
 
     // If nothing else has exited yet, then exit
     usleep(100000); // Sleep for 100us, just to allow all other threads to exit (that sent the kDmExecMsg_MtpThreadExited message)
-    exit(0);
+    exit(SimExitCode(exit_action));
 }
 
 #ifndef REMOVE_USP_BROKER

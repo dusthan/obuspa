@@ -111,9 +111,30 @@ int nu_macaddr_wan_macaddr(unsigned char *buf)
     int err;
     int sock;
     struct ifreq ifr;
+    const char *sim_mac;
+    unsigned int m[MAC_ADDR_LEN];
+    char tail;
+    int i;
 
     // Set default return MAC address
     memset(buf, 0, MAC_ADDR_LEN);
+
+    // CPE simulator override of the WAN MAC address (format XX:XX:XX:XX:XX:XX)
+    sim_mac = getenv("USP_SIM_MAC");
+    if ((sim_mac != NULL) && (*sim_mac != '\0'))
+    {
+        if ((strlen(sim_mac) == (MAC_ADDR_LEN*3 - 1)) &&
+            (sscanf(sim_mac, "%2x:%2x:%2x:%2x:%2x:%2x%c", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &tail) == MAC_ADDR_LEN))
+        {
+            for (i=0; i<MAC_ADDR_LEN; i++)
+            {
+                buf[i] = (unsigned char)m[i];
+            }
+            return USP_ERR_OK;
+        }
+
+        USP_LOG_Warning("%s: Ignoring invalid USP_SIM_MAC='%s'", __FUNCTION__, sim_mac);
+    }
 
     // Set up which interface we want to get the MAC address of
     memset(&ifr, 0x00, sizeof(ifr));
