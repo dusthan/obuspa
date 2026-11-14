@@ -58,7 +58,8 @@
 ```
 obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
        [--sim-oui OUI] [--sim-sn-fmt FMT] [--sim-eid-fmt FMT]
-       [--sim-ramp RATE] [其余 obuspa 原参数 -r -x -v -p -i ...]
+       [--sim-ramp RATE] [--sim-reset FILE] [--sim-log stdout|syslog|file]
+       [--sim-reidentify] [其余 obuspa 原参数 -x -v -p -i ...]
 ```
 
 | 参数 | 默认 | 含义 |
@@ -71,15 +72,17 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 | `--sim-sn-fmt FMT` | `SIM%08u` | SN 模板（printf 风格，唯一参数为全局 idx） |
 | `--sim-eid-fmt FMT` | 空 → `os::<OUI>-<SN>` | EndpointID 模板，支持占位符（见 5.3） |
 | `--sim-ramp RATE` | 20 | 启动节奏：每秒启动的 CPE 数（0 = 不限速） |
-| `--sim-reidentify` | 关 | 接受与 `sim.conf` 不一致的身份参数并应用到已有实例（见 5.4） |
+| `--sim-reset FILE` | 无 | factory reset 文件模板（可用占位符，见 5.3）；模拟模式下取代 `-r` |
+| `--sim-log MODE` | `stdout` | 日志去向：`stdout` / `syslog` / `file`；模拟模式下取代 `-l` |
+| `--sim-reidentify` | 关 | 接受与 `sim.conf` 不一致的身份参数，并对所有实例做 factory reset（见 5.4） |
 
-未给出任何 `--sim-*` 参数时，obuspa 行为与现在完全一致。
+未给出任何 `--sim-*` 参数时，obuspa 行为与现在完全一致。模拟模式下 `-f -s -r -l -c` 及其长选项与 `--sim-*` 同时出现时直接拒绝（实现者的决定）。
 
 ### 5.2 编号
 
 - 工作进程号 `p ∈ [0, N)`，进程内实例号 `i ∈ [0, M)`。
 - 全局编号 `idx = B + p × M + i`，所有身份由 idx 派生，保证可复现。
-- MAC：`02:<idx 的 40 位，大端>`（本地管理地址段），供 tr181 mock 的 MACAddress 等参数和"WAN MAC"使用。
+- MAC：`02:<idx 的 32 位，大端>:<子字节>`（本地管理地址段）。CPE 主 MAC（`USP_SIM_MAC`、`${MAC}`）的子字节为 `00`；tr181 mock 中每个 `*MACAddress` 种子值保留其原最后一字节作为子字节（实现者的决定；原稿为 40 位 idx）。idx ≤ 0xFFFFFFFF。
 
 ### 5.3 模板占位符
 
@@ -109,12 +112,12 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
     mock.db         # tr181 mock 后端持久化数据（见 5.5）
     reset.txt       # 展开占位符后的 factory reset 文件（每次启动重新生成，便于排查）
     cli.sock        # 该 CPE 的 CLI Unix socket
-    agent.log       # 该 CPE 日志（指定 -l 为文件时；stdout/syslog 时加 [SN] 前缀）
+    agent.log       # 该 CPE 日志（`--sim-log file` 时；stdout/syslog 时加 [SN] 前缀）
 ```
 
 - 目录按 idx 而不是 SN 命名（实现者的决定：SN 模板变化时目录不会变成孤儿；idx 才是稳定主键）。
 - DB 已存在时沿用（身份与配置持久）；删除实例目录即该 CPE 恢复出厂。
-- 身份参数一致性（实现者的决定）：首次运行写入 `sim.conf`。之后以不同的 oui/sn-fmt/eid-fmt/base 复用同一 sim-root 时，supervisor 报错退出并给出差异；只有加 `--sim-reidentify` 才接受新参数，这时会删除各实例 DB 中保存的 OUI/SN/EndpointID 覆盖值，让新身份生效（否则 DB 中的旧值优先，新参数会被悄悄忽略）。
+- 身份参数一致性（实现者的决定）：首次运行写入 `sim.conf`。之后以不同的 oui/sn-fmt/eid-fmt/base 复用同一 sim-root 时，supervisor 报错退出并给出差异；只有加 `--sim-reidentify` 才接受新参数，这时对所有实例做 factory reset（删除各实例的 `usp.db` 与 `mock.db`），让新身份生效（否则 DB 中的旧值优先，新参数会被悄悄忽略）。`sim.conf` 只比较 `base oui sn_fmt eid_fmt`；`procs`、`per_proc` 变化允许复用同一 root。
 - 对单个 CPE 执行 CLI：`obuspa -c -s <sim-root>/cpe-<idx>/cli.sock get Device.DeviceInfo.`（复用现有 `-s`）。
 
 ### 5.5 tr181 mock 后端
@@ -122,7 +125,8 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 - 每个 CPE 一份数据：种子值来自 CSV，SN、MAC、ManufacturerOUI 等身份相关参数按实例改写。
 - 已核实：插件自己注册了 `Device.DeviceInfo.SerialNumber`、`ManufacturerOUI`，CSV 种子值分别是 `C100023710001066` 和 `666666`；插件没有注册 SN/EndpointID 的 vendor hook，所以核心会使用环境变量 `USP_BOARD_SERIAL`。不改写的话，Controller Get 到的 SN 对所有 CPE 都一样，并且和 EndpointID 对不上。因此这两个参数必须由 sim 身份改写（MACAddress 类参数同理）。
 - **持久化（用户确认要保留）**：mock 的 Set/AddInstance/DeleteInstance 写入实例目录下的 `mock.db`，启动时先载入 CSV 种子值，再叠加 `mock.db` 中的值。只读的动态参数（统计计数等）不持久化。存储格式由实现者决定（建议 sqlite，与核心一致，或者追加写的 KV 文件）。
-- FactoryReset 时 `mock.db` 与 `usp.db` 一起清空。
+- FactoryReset 时 `mock.db` 与 `usp.db` 一起清空（由 supervisor 在收到退出码 11 后删除，见 5.6）。
+- 仅当设置了环境变量 `TR181_MOCK_DB` 时插件才持久化（实现者的决定）；sim 模式下 supervisor 为每个 CPE 设为 `<dir>/mock.db`。
 - 非模拟模式（单个 obuspa + 插件）同样受益于持久化；持久化文件路径默认放在 DB 同目录。
 
 ### 5.6 Supervisor 行为
@@ -130,7 +134,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 - 前台运行，按 `--sim-ramp` 节奏启动全部 CPE；子进程异常退出时自动重启（带退避，防止崩溃死循环）。
 - 区分退出原因（实现者的决定）：目前 Reboot、FactoryReset、CLI `stop` 都以 `exit(0)` 结束（`src/core/dm_exec.c:1702-1754`）。在模拟模式（环境变量 `USP_SIM_IDX` 存在）下改为不同的退出码：Reboot = 10、FactoryReset = 11、stop = 0。非模拟模式行为不变。
   - Reboot：立即重启该 CPE，不计入异常。
-  - FactoryReset：同上；`usp.db`、`mock.db` 的清理沿用核心现有的 factory reset 流程，`mock.db` 由插件在 FactoryReset 时自行清除。
+  - FactoryReset：同上；`usp.db`、`mock.db` 的清理沿用核心现有的 factory reset 流程，`mock.db` 由 supervisor 在收到退出码 11 时与 `usp.db` 一并删除，插件不负责清除。
   - stop（CLI）：该 CPE 保持停止，不再拉起。
   - 其他退出码或信号：视为崩溃，带退避重启。
 - SIGINT/SIGTERM：向所有子进程转发并等待退出。
