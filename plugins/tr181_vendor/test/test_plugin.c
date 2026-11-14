@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sqlite3.h>
 #include "tr181_backend.h"
 
 #include "usp_err_codes.h"
@@ -344,6 +345,115 @@ static void test_mock_persist_open_failure(void)
     ClearSimEnv();
 }
 
+
+static void SqlOnDb(const char *db_path, const char *sql)
+{
+    sqlite3 *h = NULL;
+    char *msg = NULL;
+    CHECK((sqlite3_open(db_path, &h) == SQLITE_OK) && (sqlite3_exec(h, sql, NULL, NULL, &msg) == SQLITE_OK), "test sql '%s' failed: %s", sql, msg ? msg : "?");
+    sqlite3_free(msg);
+    sqlite3_close(h);
+}
+
+static void test_mock_readd_clears_children(void)
+{
+    char db[256];
+    char buf[64];
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "readd_children: Init failed");
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.5") == TR181_BE_OK, "readd_children: add parent");
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.5.Sub.1") == TR181_BE_OK, "readd_children: add child");
+    CHECK(TR181_BE_Set("Device.Hosts.AccessControl.5.Sub.1.X", "v") == TR181_BE_OK, "readd_children: set child");
+    CHECK(TR181_BE_DeleteInstance("Device.Hosts.AccessControl.5") == TR181_BE_OK, "readd_children: delete");
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.5") == TR181_BE_OK, "readd_children: re-add");
+    CHECK(!BeHasInstance("Device.Hosts.AccessControl.5.Sub.", 1), "readd_children: child present in memory");
+    TR181_BE_Stop();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "readd_children: re-Init failed");
+    CHECK(BeHasInstance("Device.Hosts.AccessControl.", 5), "readd_children: parent missing");
+    CHECK(!BeHasInstance("Device.Hosts.AccessControl.5.Sub.", 1), "readd_children: child resurrected");
+    CHECK(TR181_BE_Get("Device.Hosts.AccessControl.5.Sub.1.X", buf, sizeof(buf)) == TR181_BE_NOT_FOUND, "readd_children: child value resurrected");
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
+static void test_mock_readd_seed_instance(void)
+{
+    char db[256];
+    char buf[64];
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "readd_seed: Init failed");
+    CHECK(TR181_BE_DeleteInstance("Device.Hosts.AccessControl.2") == TR181_BE_OK, "readd_seed: delete");
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.2") == TR181_BE_OK, "readd_seed: re-add");
+    CHECK(TR181_BE_Get("Device.Hosts.AccessControl.2.HostName", buf, sizeof(buf)) == TR181_BE_NOT_FOUND, "readd_seed: seed value present in memory");
+    TR181_BE_Stop();
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "readd_seed: re-Init failed");
+    CHECK(BeHasInstance("Device.Hosts.AccessControl.", 2), "readd_seed: instance missing");
+    CHECK(TR181_BE_Get("Device.Hosts.AccessControl.2.HostName", buf, sizeof(buf)) == TR181_BE_NOT_FOUND, "readd_seed: seed value came back");
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
+static void test_mock_delete_prefix_safety(void)
+{
+    char db[256];
+    char buf[64];
+    int pass;
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "prefix: Init failed");
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.10") == TR181_BE_OK, "prefix: add 10");
+    CHECK(TR181_BE_Set("Device.Hosts.AccessControl.10.HostName", "ten") == TR181_BE_OK, "prefix: set 10");
+    CHECK(TR181_BE_DeleteInstance("Device.Hosts.AccessControl.1") == TR181_BE_OK, "prefix: delete 1");
+    for (pass=0; pass < 2; pass++)
+    {
+        CHECK(!BeHasInstance("Device.Hosts.AccessControl.", 1), "prefix: instance 1 present (pass %d)", pass);
+        CHECK(BeHasInstance("Device.Hosts.AccessControl.", 10), "prefix: instance 10 lost (pass %d)", pass);
+        BeExpect("Device.Hosts.AccessControl.10.HostName", "ten");
+        CHECK(TR181_BE_Get("Device.Hosts.AccessControl.1.HostName", buf, sizeof(buf)) == TR181_BE_NOT_FOUND, "prefix: value of 1 present (pass %d)", pass);
+        if (pass == 0)
+        {
+            TR181_BE_Stop();
+            CHECK(TR181_BE_Init() == TR181_BE_OK, "prefix: re-Init failed");
+        }
+    }
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
+// A trigger added through a second connection makes writes fail inside the plug-in's own handle
+static void test_mock_db_write_failure(void)
+{
+    char db[256];
+    ClearSimEnv();
+    TempDbPath(db, sizeof(db));
+    setenv("TR181_MOCK_DB", db, 1);
+    CHECK(TR181_BE_Init() == TR181_BE_OK, "write_fail: Init failed");
+    SqlOnDb(db, "CREATE TRIGGER t_kv BEFORE INSERT ON kv BEGIN SELECT RAISE(ABORT, 'test'); END;"
+                "CREATE TRIGGER t_inst BEFORE INSERT ON inst BEGIN SELECT RAISE(ABORT, 'test'); END;");
+
+    CHECK(TR181_BE_Set("Device.WiFi.SSID.1.SSID", "fail") == TR181_BE_ERROR, "write_fail: Set should fail");
+    BeExpect("Device.WiFi.SSID.1.SSID", "CPE-C201-TEST4-5G");
+
+    CHECK(TR181_BE_AddInstance("Device.Hosts.AccessControl.5") == TR181_BE_ERROR, "write_fail: Add should fail");
+    CHECK(!BeHasInstance("Device.Hosts.AccessControl.", 5), "write_fail: instance added in memory");
+
+    // Delete: the tombstone insert fails after the row deletes, which must be rolled back
+    CHECK(TR181_BE_DeleteInstance("Device.Hosts.AccessControl.2") == TR181_BE_ERROR, "write_fail: Delete should fail");
+    CHECK(BeHasInstance("Device.Hosts.AccessControl.", 2), "write_fail: instance removed in memory");
+    BeExpect("Device.Hosts.AccessControl.2.HostName", "test-PC2");
+    TR181_BE_Stop();
+    RemoveDb(db);
+    ClearSimEnv();
+}
+
 static void RunMockTests(void)
 {
     test_mock_identity_rewrite();
@@ -353,6 +463,10 @@ static void RunMockTests(void)
     test_mock_persist_delete_seed();
     test_mock_no_db_memory_only();
     test_mock_persist_open_failure();
+    test_mock_readd_clears_children();
+    test_mock_readd_seed_instance();
+    test_mock_delete_prefix_safety();
+    test_mock_db_write_failure();
 }
 
 int main(void)

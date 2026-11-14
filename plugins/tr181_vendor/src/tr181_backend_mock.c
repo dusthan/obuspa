@@ -50,6 +50,8 @@ static sqlite3 *db = NULL;
 static sqlite3_stmt *stmt_set = NULL;
 static sqlite3_stmt *stmt_inst = NULL;
 static sqlite3_stmt *stmt_del_kv = NULL;
+static sqlite3_stmt *stmt_del_inst = NULL;
+static sqlite3_stmt *stmt_get_inst = NULL;
 
 //------------------------------------------------------------------------------
 // Forward declarations
@@ -61,7 +63,8 @@ static int ReplayDb(void);
 static int DbExec(const char *sql);
 static int DbStep(sqlite3_stmt *st, const char *what);
 static int DbSetValue(const char *path, const char *value);
-static int DbSetInstance(const char *obj_path, int present);
+static int DbAddInstance(const char *obj_path);
+static int DbDeleteInstance(const char *obj_path);
 static int RemoveInstance(const char *obj_path);
 static bool EndsWith(const char *s, const char *suffix);
 static unsigned Hash(const char *s);
@@ -153,11 +156,12 @@ int TR181_BE_Get(const char *path, char *buf, int len)
 
 int TR181_BE_Set(const char *path, const char *value)
 {
-    if (StoreValue(path, value) != TR181_BE_OK)
+    // Persist first: memory only changes if the db write succeeded
+    if (DbSetValue(path, value) != TR181_BE_OK)
     {
         return TR181_BE_ERROR;
     }
-    return DbSetValue(path, value);
+    return (StoreValue(path, value) == TR181_BE_OK) ? TR181_BE_OK : TR181_BE_ERROR;
 }
 
 int TR181_BE_GetInstances(const char *table_prefix, int *insts, int max, int *num)
@@ -201,20 +205,24 @@ int TR181_BE_GetInstances(const char *table_prefix, int *insts, int max, int *nu
 
 int TR181_BE_AddInstance(const char *obj_path)
 {
-    if (AddInstancePath(obj_path) != TR181_BE_OK)
+    if (DbAddInstance(obj_path) != TR181_BE_OK)
     {
         return TR181_BE_ERROR;
     }
-    return DbSetInstance(obj_path, 1);
+    return (AddInstancePath(obj_path) == TR181_BE_OK) ? TR181_BE_OK : TR181_BE_ERROR;
 }
 
 int TR181_BE_DeleteInstance(const char *obj_path)
 {
-    if (RemoveInstance(obj_path) != TR181_BE_OK)
+    if (strlen(obj_path) + 2 > 512)     // RemoveInstance() child prefix buffer
     {
         return TR181_BE_ERROR;
     }
-    return DbSetInstance(obj_path, 0);
+    if (DbDeleteInstance(obj_path) != TR181_BE_OK)
+    {
+        return TR181_BE_ERROR;
+    }
+    return RemoveInstance(obj_path);
 }
 
 //------------------------------------------------------------------------------
@@ -403,7 +411,9 @@ static int OpenDb(const char *file)
 
     if ((Prepare(&stmt_set, "INSERT OR REPLACE INTO kv(path, value) VALUES(?1, ?2)") != TR181_BE_OK) ||
         (Prepare(&stmt_inst, "INSERT OR REPLACE INTO inst(path, present) VALUES(?1, ?2)") != TR181_BE_OK) ||
-        (Prepare(&stmt_del_kv, "DELETE FROM kv WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'") != TR181_BE_OK))
+        (Prepare(&stmt_del_kv, "DELETE FROM kv WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'") != TR181_BE_OK) ||
+        (Prepare(&stmt_del_inst, "DELETE FROM inst WHERE path LIKE ?1 ESCAPE '\\'") != TR181_BE_OK) ||
+        (Prepare(&stmt_get_inst, "SELECT present FROM inst WHERE path = ?1") != TR181_BE_OK))
     {
         return TR181_BE_ERROR;
     }
@@ -415,7 +425,9 @@ static void CloseDb(void)
     sqlite3_finalize(stmt_set);
     sqlite3_finalize(stmt_inst);
     sqlite3_finalize(stmt_del_kv);
-    stmt_set = stmt_inst = stmt_del_kv = NULL;
+    sqlite3_finalize(stmt_del_inst);
+    sqlite3_finalize(stmt_get_inst);
+    stmt_set = stmt_inst = stmt_del_kv = stmt_del_inst = stmt_get_inst = NULL;
     if (db != NULL)
     {
         sqlite3_close(db);
@@ -429,8 +441,9 @@ static int ReplayDb(void)
     int rc;
     int err = TR181_BE_OK;
 
-    // Instances first (present=0 also removes the values and sub-instances below it)
-    if (Prepare(&st, "SELECT path, present FROM inst ORDER BY rowid") != TR181_BE_OK)
+    // Instances first, parents before children (a delete also removes the values and sub-instances below it)
+    if (Prepare(&st, "SELECT path, present FROM inst "
+                "ORDER BY length(path) - length(replace(path, '.', '')), rowid") != TR181_BE_OK)
     {
         return TR181_BE_ERROR;
     }
@@ -443,7 +456,15 @@ static int ReplayDb(void)
         {
             continue;
         }
-        err = present ? AddInstancePath(path) : RemoveInstance(path);
+        // present: 0 = deleted, 1 = added, 2 = re-added after delete (clears seed values below it first)
+        if ((present == 0) || (present == 2))
+        {
+            err = RemoveInstance(path);
+        }
+        if ((err == TR181_BE_OK) && (present != 0))
+        {
+            err = AddInstancePath(path);
+        }
         if (err != TR181_BE_OK)
         {
             break;
@@ -514,7 +535,39 @@ static int DbSetValue(const char *path, const char *value)
     return DbStep(stmt_set, "kv write");
 }
 
-static int DbSetInstance(const char *obj_path, int present)
+static int DbAddInstance(const char *obj_path)
+{
+    int present = 1;
+    int rc;
+
+    if (db == NULL)
+    {
+        return TR181_BE_OK;
+    }
+
+    // A tombstone means the instance existed before (e.g. a seed) and was deleted: mark it re-added
+    sqlite3_bind_text(stmt_get_inst, 1, obj_path, -1, SQLITE_STATIC);
+    rc = sqlite3_step(stmt_get_inst);
+    if (rc == SQLITE_ROW)
+    {
+        present = (sqlite3_column_int(stmt_get_inst, 0) == 1) ? 1 : 2;
+    }
+    sqlite3_reset(stmt_get_inst);
+    sqlite3_clear_bindings(stmt_get_inst);
+    if ((rc != SQLITE_ROW) && (rc != SQLITE_DONE))
+    {
+        USP_LOG_Error("%s: sqlite inst read failed: %s", __func__, sqlite3_errmsg(db));
+        return TR181_BE_ERROR;
+    }
+
+    sqlite3_bind_text(stmt_inst, 1, obj_path, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt_inst, 2, present);
+    return DbStep(stmt_inst, "inst write");
+}
+
+// Deleting records a tombstone and drops all persisted rows (instances and values) below the path,
+// atomically, so the database never disagrees with what a restart would rebuild
+static int DbDeleteInstance(const char *obj_path)
 {
     char *pattern;
     size_t i;
@@ -526,15 +579,7 @@ static int DbSetInstance(const char *obj_path, int present)
         return TR181_BE_OK;
     }
 
-    sqlite3_bind_text(stmt_inst, 1, obj_path, -1, SQLITE_STATIC);
-    sqlite3_bind_int(stmt_inst, 2, present);
-    err = DbStep(stmt_inst, "inst write");
-    if ((err != TR181_BE_OK) || present)
-    {
-        return err;
-    }
-
-    // Deleted: drop persisted values at and below the instance (escape LIKE wildcards in the path)
+    // LIKE pattern for "<obj_path>.%" with wildcards in the path escaped
     pattern = malloc(strlen(obj_path) * 2 + 3);
     if (pattern == NULL)
     {
@@ -552,9 +597,32 @@ static int DbSetInstance(const char *obj_path, int present)
     pattern[n++] = '%';
     pattern[n] = '\0';
 
-    sqlite3_bind_text(stmt_del_kv, 1, obj_path, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt_del_kv, 2, pattern, -1, SQLITE_STATIC);
-    err = DbStep(stmt_del_kv, "kv delete");
+    err = DbExec("BEGIN");
+    if (err == TR181_BE_OK)
+    {
+        sqlite3_bind_text(stmt_del_inst, 1, pattern, -1, SQLITE_STATIC);
+        err = DbStep(stmt_del_inst, "inst delete");
+    }
+    if (err == TR181_BE_OK)
+    {
+        sqlite3_bind_text(stmt_del_kv, 1, obj_path, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt_del_kv, 2, pattern, -1, SQLITE_STATIC);
+        err = DbStep(stmt_del_kv, "kv delete");
+    }
+    if (err == TR181_BE_OK)
+    {
+        sqlite3_bind_text(stmt_inst, 1, obj_path, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt_inst, 2, 0);
+        err = DbStep(stmt_inst, "inst tombstone");
+    }
+    if (err == TR181_BE_OK)
+    {
+        err = DbExec("COMMIT");
+    }
+    if (err != TR181_BE_OK)
+    {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);     // no-op if no transaction is open
+    }
     free(pattern);
     return err;
 }
