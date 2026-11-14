@@ -3,6 +3,11 @@
 
 #include <stdio.h>
 
+// Fallback for platforms whose <sys/wait.h> lacks W_EXITCODE
+#ifndef W_EXITCODE
+#define W_EXITCODE(code, sig) (((code) << 8) | (sig))
+#endif
+
 static int g_test_failures = 0;
 
 #define CHECK(cond, ...) \
