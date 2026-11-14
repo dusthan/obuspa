@@ -154,6 +154,31 @@ static void test_conf_roundtrip(void)
     CHECK(SIM_ConfCompare(path, &c, diff, sizeof(diff)) == -1, "missing");
 }
 
+static void test_conf_corrupt_and_injection(void)
+{
+    sim_config_t c; char diff[256] = "", path[64], err[256] = "";
+    snprintf(path, sizeof(path), "/tmp/sim_test_conf2_%d", (int)getpid());
+    base_cfg(&c);
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "open");
+    if (f == NULL) return;
+    fprintf(f, "base=0\noui=012345\nsn_fmt=SIM%%08u\neid_fmt=");
+    for (int i = 0; i < 400; i++) fputc('x', f);
+    fputs("\nsn_fmt=SIM%08u\n", f);
+    fclose(f);
+    CHECK(SIM_ConfCompare(path, &c, diff, sizeof(diff)) == 1, "long line differs");
+    CHECK(strstr(diff, "too long") != NULL, "diff %s", diff);
+    unlink(path);
+    strcpy(c.eid_fmt, "${SN}\nbase=5");
+    CHECK(SIM_ValidateConfig(&c, err, sizeof(err)) == -1, "newline in eid_fmt");
+    CHECK(strstr(err, "eid-fmt") != NULL, "err %s", err);
+    base_cfg(&c); strcpy(c.sn_fmt, "%u\n");
+    CHECK(SIM_ValidateConfig(&c, err, sizeof(err)) == -1, "newline in sn_fmt");
+    CHECK(strstr(err, "sn-fmt") != NULL, "err %s", err);
+    base_cfg(&c); strcpy(c.oui, "01\n23");
+    CHECK(SIM_ValidateConfig(&c, err, sizeof(err)) == -1, "newline in oui");
+}
+
 static void test_map_row(void)
 {
     sim_config_t c; sim_identity_t id; char err[256], buf[1024] = "";
@@ -186,6 +211,7 @@ int main(void)
     test_template_all_placeholders();
     test_template_errors();
     test_conf_roundtrip();
+    test_conf_corrupt_and_injection();
     test_map_row();
     if (g_test_failures == 0) printf("PASS test_sim_identity\n");
     return g_test_failures;

@@ -86,7 +86,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 
 ### 5.3 模板占位符
 
-在 `--sim-eid-fmt` 与 factory reset 文件（`-r`）中可用：
+在 `--sim-eid-fmt` 与 factory reset 文件中可用（模拟模式下该文件通过 `--sim-reset` 传入，supervisor 展开后再以 `-r` 传给子进程）：
 
 | 占位符 | 值 |
 |---|---|
@@ -95,7 +95,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 | `${OUI}` | OUI |
 | `${SN}` | 序列号 |
 | `${EID}` | EndpointID |
-| `${MAC}` / `${MACX}` | `02:00:00:00:00:2A` / `02000000002A` |
+| `${MAC}` / `${MACX}` | `02:00:00:00:2A:00` / `020000002A00` |
 
 用途：为每台 CPE 生成不同的 MQTT ClientID、Username/Password、ResponseTopic 等，例如
 `Device.MQTT.Client.1.ClientID "${SN}"`、`Device.LocalAgent.MTP.1.MQTT.ResponseTopicConfigured "usp/agent/${EID}"`。
@@ -125,7 +125,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 - 每个 CPE 一份数据：种子值来自 CSV，SN、MAC、ManufacturerOUI 等身份相关参数按实例改写。
 - 已核实：插件自己注册了 `Device.DeviceInfo.SerialNumber`、`ManufacturerOUI`，CSV 种子值分别是 `C100023710001066` 和 `666666`；插件没有注册 SN/EndpointID 的 vendor hook，所以核心会使用环境变量 `USP_BOARD_SERIAL`。不改写的话，Controller Get 到的 SN 对所有 CPE 都一样，并且和 EndpointID 对不上。因此这两个参数必须由 sim 身份改写（MACAddress 类参数同理）。
 - **持久化（用户确认要保留）**：mock 的 Set/AddInstance/DeleteInstance 写入实例目录下的 `mock.db`，启动时先载入 CSV 种子值，再叠加 `mock.db` 中的值。只读的动态参数（统计计数等）不持久化。存储格式由实现者决定（建议 sqlite，与核心一致，或者追加写的 KV 文件）。
-- FactoryReset 时 `mock.db` 与 `usp.db` 一起清空（由 supervisor 在收到退出码 11 后删除，见 5.6）。
+- FactoryReset 时 `mock.db` 由 supervisor 在收到退出码 11 后删除（见 5.6）；`usp.db` 由核心现有的 controller 发起 factory reset 流程重置。
 - 仅当设置了环境变量 `TR181_MOCK_DB` 时插件才持久化（实现者的决定）；sim 模式下 supervisor 为每个 CPE 设为 `<dir>/mock.db`。
 - 非模拟模式（单个 obuspa + 插件）同样受益于持久化；持久化文件路径默认放在 DB 同目录。
 
@@ -134,7 +134,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 - 前台运行，按 `--sim-ramp` 节奏启动全部 CPE；子进程异常退出时自动重启（带退避，防止崩溃死循环）。
 - 区分退出原因（实现者的决定）：目前 Reboot、FactoryReset、CLI `stop` 都以 `exit(0)` 结束（`src/core/dm_exec.c:1702-1754`）。在模拟模式（环境变量 `USP_SIM_IDX` 存在）下改为不同的退出码：Reboot = 10、FactoryReset = 11、stop = 0。非模拟模式行为不变。
   - Reboot：立即重启该 CPE，不计入异常。
-  - FactoryReset：同上；`mock.db` 由 supervisor 在收到退出码 11 时删除，插件不负责清除；`usp.db` 同样由 supervisor 删除。
+  - FactoryReset：同上；supervisor 在收到退出码 11 时只删除 `mock.db`（插件不负责清除）；`usp.db` 由核心现有的 controller 发起 factory reset 流程（`DATABASE_PerformFactoryReset_ControllerInitiated` + reset 文件）重置，该流程同时保留 FactoryReset 启动原因。只有 `--sim-reidentify` 会删除 `usp.db`。
   - stop（CLI）：该 CPE 保持停止，不再拉起。
   - 其他退出码或信号：视为崩溃，带退避重启。
 - SIGINT/SIGTERM：向所有子进程转发并等待退出。
@@ -143,7 +143,7 @@ obuspa --sim-procs N --sim-per-proc M [--sim-base B] [--sim-root DIR]
 ## 6. 阶段 1：多进程
 
 - 在 `main()` 中识别 `--sim-*`，进入 supervisor 模式；supervisor 计算每个 CPE 的身份，生成目录与展开后的 reset 文件，然后 fork + exec 自身（不带 `--sim-*`），通过环境变量
-  `USP_BOARD_OUI / USP_BOARD_SERIAL / USP_ENDPOINT_ID / USP_SIM_IDX / USP_SIM_MAC`（新增后两者）以及 `-f -r -s -l` 参数传入身份与路径。
+  `USP_BOARD_OUI / USP_BOARD_SERIAL / USP_ENDPOINT_ID / USP_SIM_IDX / USP_SIM_MAC`（新增后两者）以及 `-f -r -s -l` 参数传入身份与路径（用户侧的 reset 文件经 `--sim-reset` 给出，`-r` 仅由 supervisor 传给子进程）。
 - 核心改动仅限：main 中的 supervisor 入口、新增模块 `src/core/sim_supervisor.c`、身份获取处读取 `USP_SIM_MAC`（用于替代 WAN MAC）、`dm_exec.c` 在模拟模式下使用区分原因的退出码（见 5.6）。
 - tr181 mock 后端在 `TR181_BE_Init()` 读取 `USP_SIM_*` 环境变量改写身份相关种子值，并实现 `mock.db` 持久化（见 5.5）。
 - 阶段 1 中 N×M 个 CPE 各占一个进程；`--sim-per-proc` 只影响编号与分组，不影响进程内实例数。

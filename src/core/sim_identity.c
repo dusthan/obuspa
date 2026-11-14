@@ -132,7 +132,7 @@ void SIM_PercentEncode(const char *src, char *dst, size_t dst_len)
     for (; *src != '\0'; src++)
     {
         unsigned char c = (unsigned char)*src;
-        if (isalnum(c) || c == '-' || c == '.' || c == '_')
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_')
         {
             if (o + 1 >= dst_len) break;
             dst[o++] = (char)c;
@@ -280,6 +280,13 @@ static bool eid_fmt_has_varying(const char *fmt)
     return strstr(fmt, "${SN}") || strstr(fmt, "${IDX}") || strstr(fmt, "${MAC}") || strstr(fmt, "${MACX}");
 }
 
+static bool has_ctrl(const char *s)
+{
+    for (; *s != '\0'; s++)
+        if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7F) return true;
+    return false;
+}
+
 int SIM_ValidateConfig(const sim_config_t *cfg, char *err, size_t err_len)
 {
     unsigned long long last;
@@ -309,6 +316,9 @@ int SIM_ValidateConfig(const sim_config_t *cfg, char *err, size_t err_len)
                 SIM_SOCK_SUFFIX, SIM_SUN_PATH_MAX);
         return -1;
     }
+    if (has_ctrl(cfg->oui)) { set_err(err, err_len, "sim-oui contains control characters"); return -1; }
+    if (has_ctrl(cfg->sn_fmt)) { set_err(err, err_len, "sn-fmt contains control characters"); return -1; }
+    if (has_ctrl(cfg->eid_fmt)) { set_err(err, err_len, "eid-fmt contains control characters"); return -1; }
     if (cfg->oui[0] == '\0' || strlen(cfg->oui) >= sizeof(cfg->oui))
     {
         set_err(err, err_len, "sim-oui must be non-empty and shorter than %zu chars", sizeof(cfg->oui));
@@ -391,6 +401,13 @@ int SIM_ConfCompare(const char *path, const sim_config_t *cfg, char *diff, size_
     {
         char *eq = strchr(line, '=');
         size_t l = strlen(line);
+        if (l > 0 && line[l - 1] != '\n' && !feof(f))
+        {
+            /* over-long line: file is corrupt, report as differing */
+            append(diff, diff_len, "sim.conf: line too long (corrupt); ");
+            fclose(f);
+            return 1;
+        }
         if (eq == NULL) continue;
         while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
         *eq++ = '\0';

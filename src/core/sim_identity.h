@@ -1,5 +1,6 @@
 /*
  * CPE simulator: identity, template and sim.conf logic.
+ * SIM_ConfCompare: an over-long (unparseable) line makes it return 1 with a diff saying so.
  * Pure libc; no USP headers.
  */
 #ifndef SIM_IDENTITY_H
