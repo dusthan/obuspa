@@ -1,0 +1,11 @@
+/* Symbols exported by libtr181_vendor.so (GNU ld / lld version script).
+ * OBUSPA's PLUGIN_Load() looks these up with dlsym(); everything else stays local so it cannot
+ * clash with, or be interposed by, symbols exported by the obuspa executable (-rdynamic). */
+{
+    global:
+        VENDOR_Init;
+        VENDOR_Start;
+        VENDOR_Stop;
+    local:
+        *;
+};

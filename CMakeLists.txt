@@ -55,6 +55,10 @@ target_link_libraries(obuspa
     vendor
     core)
 
+# Export the USP API symbols from the executable (equivalent of -rdynamic in the autotools build),
+# so that vendor plug-ins loaded with '-x' (e.g. plugins/tr181_vendor) can resolve them
+set_target_properties(obuspa PROPERTIES ENABLE_EXPORTS ON)
+
 add_subdirectory(src/libjson)
 add_subdirectory(src/protobuf-c)
 add_subdirectory(src/vendor)
