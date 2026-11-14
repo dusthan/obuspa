@@ -6,6 +6,9 @@ Open Broadband-User Services Platform-Agent (OB-USP-Agent) is an open source pro
 
 For build instructions, please refer to [QUICK_START_GUIDE](https://github.com/BroadbandForum/obuspa/blob/master/QUICK_START_GUIDE.md).
 
+For the multi-process CPE simulator on `feature/cpe-simulator`, see the
+[usage guide](docs/sim/README.md) and [2×5 CPE measurement record](docs/sim/measurements/2026-11-14-2x5.md).
+
 ## TP-469 Conformance Test Plan Results
 
 Test results for all MTPs are available in [conformance_test_results.txt](https://github.com/BroadbandForum/obuspa/blob/master/conformance_test_results.txt).

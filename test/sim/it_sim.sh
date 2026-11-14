@@ -61,16 +61,6 @@ wait_for() {
     fail "timeout waiting for: $desc"
 }
 
-# wait_for_n <polls (0.2s each)> <description> <command...>
-wait_for_n() {
-    local n=$1 desc=$2 i; shift 2
-    for ((i = 0; i < n; i++)); do
-        if "$@" >/dev/null 2>&1; then return 0; fi
-        sleep 0.2
-    done
-    fail "timeout waiting for: $desc"
-}
-
 start_sup() {
     "$OBUSPA" --sim-root "$SIMROOT" "$@" >>"$LOG" 2>&1 &
     SUP=$!
@@ -317,21 +307,29 @@ it_no_sim_unchanged() {
 
 # Needs a reachable MQTT broker: MQTT_BROKER=host:port (skipped otherwise)
 it_mqtt_connect() {
-    if [ -z "${MQTT_BROKER:-}" ]; then
-        echo "SKIP it_mqtt_connect (MQTT_BROKER not set)" >&2
-        return 0
-    fi
-    local host=${MQTT_BROKER%:*} port=${MQTT_BROKER##*:} idx
-    [ -n "$host" ] && [ "$host" != "$MQTT_BROKER" ] || fail "MQTT_BROKER must be host:port, got '$MQTT_BROKER'"
+    local host=${MQTT_BROKER%:*} port=${MQTT_BROKER##*:} idx deadline remaining value dir
+    [[ "$host" =~ ^[a-zA-Z0-9_.-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] &&
+        ((10#$port >= 1 && 10#$port <= 65535)) || fail "MQTT_BROKER must be hostname-or-IPv4:port (1..65535)"
     sed -e "s|^Device.MQTT.Client.1.BrokerAddress .*|Device.MQTT.Client.1.BrokerAddress \"$host\"|" \
         -e "s|^Device.MQTT.Client.1.BrokerPort .*|Device.MQTT.Client.1.BrokerPort \"$port\"|" \
         "$HERE/mqtt_tmpl.txt" > "$T/mqtt_tmpl.txt"
-    grep -q "BrokerAddress \"$host\"" "$T/mqtt_tmpl.txt" || fail "broker substitution failed"
+    grep -Fq "BrokerAddress \"$host\"" "$T/mqtt_tmpl.txt" || fail "broker substitution failed"
+    deadline=$((SECONDS + 60))
     start_sup --sim-procs 2 --sim-per-proc 5 --sim-base 100 --sim-ramp 0 --sim-reset "$T/mqtt_tmpl.txt" -x "$PLUGIN"
-    mqtt_connected() { [ "$(getv "$1" Device.MQTT.Client.1.Status)" == "Connected" ]; }
     for ((idx = 100; idx < 110; idx++)); do
-        wait_for_n 300 "cpe $idx MQTT Connected" mqtt_connected $idx
+        dir=$(cpedir "$idx")
+        while :; do
+            remaining=$((deadline - SECONDS))
+            ((remaining > 0)) || fail "60s fleet deadline: cpe $idx MQTT not Connected"
+            value=$(timeout "$remaining" "$OBUSPA" -s "$dir/cli.sock" -f "$dir/usp.db" \
+                -c get Device.MQTT.Client.1.Status 2>/dev/null) || value=""
+            [[ "$value" == *"Device.MQTT.Client.1.Status => Connected"* ]] && break
+            sleep 0.2
+        done
     done
+    stop_sup
+    expect_eq "MQTT supervisor shutdown rc" "$SUP_RC" 0
+    no_cpe_procs || fail "MQTT CPE processes left after shutdown"
 }
 
 # ---------------------------------------------------------------- runner
@@ -380,9 +378,16 @@ run_case() {
 CASES=("$@")
 [ ${#CASES[@]} -gt 0 ] || CASES=("${ALL_CASES[@]}")
 failed=0
+passed=0
+skipped=0
 for c in "${CASES[@]}"; do
     if ! declare -F "$c" >/dev/null; then echo "FAIL $c: no such test"; failed=$((failed + 1)); continue; fi
-    run_case "$c" || failed=$((failed + 1))
+    if [ "$c" == it_mqtt_connect ] && [ -z "${MQTT_BROKER:-}" ]; then
+        echo "SKIP $c (MQTT_BROKER not set)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    run_case "$c" && passed=$((passed + 1)) || failed=$((failed + 1))
 done
-echo "it_sim: ${#CASES[@]} run, $failed failed"
+echo "it_sim: ${#CASES[@]} selected, $passed passed, $skipped skipped, $failed failed"
 [ $failed == 0 ]

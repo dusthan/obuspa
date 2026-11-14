@@ -2,7 +2,10 @@
 
 `obuspa --sim-procs N --sim-per-proc M ...` 启动一个 supervisor，fork 出 N×M 个 obuspa 子进程。
 每个子进程是一台身份唯一、数据持久化的虚拟 CPE（独立的序列号、EndpointID、MAC、usp.db、mock.db、CLI socket）。
-设计文档：`docs/superpowers/specs/2026-11-14-cpe-simulator-design.md`。
+当前分支：`feature/cpe-simulator`。阶段 1 的 `2×5` 表示 **10 个独立 CPE 进程 + 1 个 supervisor**，
+不是两个进程各承载五台 CPE。
+设计文档：[阶段 1 设计](../superpowers/specs/2026-11-14-cpe-simulator-design.md)。
+本轮验证：[2026-11-14 的 2×5 台实测记录](measurements/2026-11-14-2x5.md)。
 
 ## 1. 快速开始
 
@@ -11,6 +14,13 @@
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 make -C plugins/tr181_vendor            # 生成 plugins/tr181_vendor/libtr181_vendor.so
+```
+
+仅验证模拟器、不连接 broker：
+
+```sh
+build/obuspa --sim-root /tmp/simroot-offline --sim-procs 2 --sim-per-proc 5 \
+    --sim-reset test/sim/reset_tmpl.txt -x plugins/tr181_vendor/libtr181_vendor.so
 ```
 
 启动 2×5 = 10 台 CPE，连接到本机 MQTT broker（先编辑 `test/sim/mqtt_tmpl.txt` 里的 `BrokerAddress`/`BrokerPort`）：
@@ -62,7 +72,8 @@ build/obuspa -s $R/cpe-$I/cli.sock -f $R/cpe-$I/usp.db -c operate "Device.Reboot
 其它规则：
 
 - `--sim-procs`/`--sim-per-proc` 在已有 root 上修改是允许的：身份只取决于 `idx`，不依赖 procs/per-proc。
-- 所有参数、全部实例的身份、以及模板对所有实例的展开，都在创建/删除任何文件之前验证；失败返回 2 且不改动磁盘。
+- 参数先校验；取得 root 锁后预校验全部身份和模板展开，失败返回 2，不改写已有 `sim.conf`、实例数据库或模板。
+  新 root 目录和临时 `sim.pid` 锁可能已创建（退出时移除锁文件）。
 - 同一个 `--sim-root` 只能有一个 supervisor（`sim.pid` + `flock`），第二个报 `another supervisor` 并返回 2。
 - `-x` 指向不存在的插件**不会**让 obuspa 崩溃（只记日志后继续运行），所以这不是崩溃循环的触发方式。
 
@@ -111,6 +122,11 @@ Device.LocalAgent.Controller.1.EndpointID "self::usp-controller"
 使用前请直接编辑该文件（或复制一份）里的 `BrokerAddress`/`BrokerPort`/账号密码；集成测试 `it_mqtt_connect`
 会用 `MQTT_BROKER=host:port` 生成一份临时副本。
 
+模板中的 broker 配置只用于首次建库或恢复出厂；修改模板后用已有 root 重启，已有 `usp.db` 的配置仍会保留。
+调试时使用新的 `--sim-root`，或通过 CLI 修改已有 MQTT 参数。`--sim-reidentify` 在身份参数不变时不会强制恢复出厂。
+容器内 `127.0.0.1` 指容器自身；外部 broker 应填写容器可访问的主机名/IP。
+此示例使用明文 TCP MQTT 5.0、空用户名和密码；实际环境的认证、TLS、ACL 和 controller topic 需按目标系统配置。
+
 ## 5. 生命周期、退出码与 `--sim-reidentify`
 
 子进程退出码（模拟模式下）：
@@ -142,8 +158,8 @@ A$ obuspa --sim-base 0    --sim-procs 10 --sim-per-proc 100 ...
 B$ obuspa --sim-base 1000 --sim-procs 10 --sim-per-proc 100 ...
 ```
 
-各机器的 `--sim-sn-fmt` / `--sim-oui` / `--sim-eid-fmt` 必须一致。MAC 的 idx 区间用完 24 位前不会重复（前缀固定 `02`，
-同一二层网段内多机共享时请注意 idx 不重叠）。
+各机器的 `--sim-sn-fmt` / `--sim-oui` / `--sim-eid-fmt` 保持一致，并使用不会截断或折叠 idx 的格式。
+MAC 使用完整 32 位 idx；合法范围为 0..4294967295，同一接口的 MAC 在 idx 不重叠时不会重复。
 
 ## 7. 系统调优
 
@@ -181,6 +197,9 @@ for p in $(pgrep -f /var/lib/cpesim/cpe-); do awk '/^Pss:/{print $2}' /proc/$p/s
 
 ## 9. 基线（阶段 1，供阶段 2 对照）
 
+以下 300/500/1000 台数据由前序 Claude 工作记录和提交 `6ec7799` 留存，本轮没有重新运行这些规模。
+本轮独立测量的 2×5 台结果及原始 JSON 见 [实测记录](measurements/2026-11-14-2x5.md)，不要将两轮数据混为同一次测试。
+
 环境：Colima VM（4 CPU / 8 GiB），Docker 容器内 Debian stable，obuspa **Release** 构建
 （`cmake -DCMAKE_BUILD_TYPE=Release`），插件 `libtr181_vendor.so`（mock 后端，`TR181_MOCK_DB` 持久化开启），
 broker 是同一容器内的 mosquitto（`mosquitto -d -p 1883`），容器使用 `--pids-limit -1 --ulimit nofile=1048576`。
@@ -206,14 +225,47 @@ broker 是同一容器内的 mosquitto（`mosquitto -d -p 1883`），容器使�
 ## 10. 测试
 
 ```sh
-test/sim/it_sim.sh build/obuspa plugins/tr181_vendor/libtr181_vendor.so              # 12 个用例，it_mqtt_connect 无 broker 时跳过
+make -C test/sim check
+make -C plugins/tr181_vendor check
+test/sim/it_sim.sh build/obuspa plugins/tr181_vendor/libtr181_vendor.so              # 13 项：12 PASS + 1 SKIP
 MQTT_BROKER=127.0.0.1:1883 test/sim/it_sim.sh build/obuspa plugins/tr181_vendor/libtr181_vendor.so it_mqtt_connect
 ```
 
 `it_mqtt_connect`：仅在设置了 `MQTT_BROKER=host:port` 时运行，用 `mqtt_tmpl.txt`（broker 替换为该值）启动 2×5 台 CPE，
-60 秒内每台的 `Device.MQTT.Client.1.Status` 必须为 `Connected`。
+整批共用 60 秒期限，每台的 `Device.MQTT.Client.1.Status` 必须为 `Connected`，随后检查正常退出和无遗留 CPE。
+支持主机名或 IPv4，端口为 1..65535；此快捷用例使用匿名明文 broker，不支持 IPv6、认证或 TLS 参数。
+未设置 broker 时输出 `SKIP`，最终汇总分别列出 passed/skipped/failed；显式指定了不可用 broker 则测试失败，不会跳过。
+`Connected` 证明 MQTT 连接建立，不代表 USP Controller 已发现设备或完成 USP Get/Set 请求；本轮没有运行 Controller。
 
-macOS 上无法构建 obuspa，使用 `test/sim/docker/run.sh '<命令>'`（Debian 镜像，内置 mosquitto）。
+### macOS / Docker 完整流程
+
+在仓库根目录运行，需已有可用的 Docker（如 Colima）。首次构建镜像需要网络下载依赖：
+
+```sh
+docker build -t obuspa-sim-dev test/sim/docker
+test/sim/docker/run.sh 'cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release && cmake --build build-linux -j4 && make -C plugins/tr181_vendor'
+test/sim/docker/run.sh 'make -C test/sim check && make -C plugins/tr181_vendor check && test/sim/it_sim.sh build-linux/obuspa plugins/tr181_vendor/libtr181_vendor.so'
+test/sim/docker/run.sh 'mosquitto -p 1883 > /tmp/sim-broker.log 2>&1 & broker_pid=$!; trap "kill $broker_pid 2>/dev/null || true" EXIT; MQTT_BROKER=127.0.0.1:1883 test/sim/it_sim.sh build-linux/obuspa plugins/tr181_vendor/libtr181_vendor.so it_mqtt_connect'
+```
+
+`run.sh` 将源码同步到 Docker volume `obuspa-sim-src:/src`，不是宿主机 bind mount；
+`build-linux` 和容器内生成的测试数据存储在 volume 中，容器退出后仍保留。
+它使用共享构建目录，应串行执行，避免同时覆盖另一个正在运行的构建或测试。
+
+### 可重复执行的 2×5 台测量
+
+Linux 上运行以下命令（输出目录必须不存在）。脚本等待整批就绪，再稳定运行 30 秒，
+检查身份、10 份独立数据库、资源与正常退出；带 `--mqtt-broker` 时还检查 ClientID、响应 topic 和连接状态。
+
+```sh
+python3 test/sim/measure_2x5.py build/obuspa plugins/tr181_vendor/libtr181_vendor.so /tmp/measure-offline
+python3 test/sim/measure_2x5.py build/obuspa plugins/tr181_vendor/libtr181_vendor.so /tmp/measure-mqtt --mqtt-broker 127.0.0.1:1883
+```
+
+本地 broker 需预先启动；使用 `127.0.0.1` 时要求该端口仅承载这 10 台测试 CPE，脚本会从同一网络命名空间的
+`/proc/net/tcp` 校验 broker 侧 10 个 ESTABLISHED 连接。远程 broker 不做此计数。
+输出包含 `result.json`、`supervisor.log`、展开模板和实例目录；失败返回非零并保留现场。
+PSS/RSS/线程只汇总 10 个 CPE，supervisor 单列，broker 不计入。RSS 会重复计算共享页，容量评估优先参考 PSS。
 
 ## 11. 已知限制
 
