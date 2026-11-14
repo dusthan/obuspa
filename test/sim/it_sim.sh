@@ -24,7 +24,7 @@ CTRL_EID="Device.LocalAgent.Controller.1.EndpointID"
 ALL_CASES=(it_identities it_persist_reboot it_factory_reset it_stop_stays_down it_crash_restart
            it_restart_keeps_identity it_conf_mismatch it_second_supervisor_refused
            it_bad_template_no_damage it_no_orphans_after_sigterm it_crash_loop_backoff
-           it_no_sim_unchanged)
+           it_no_sim_unchanged it_mqtt_connect)
 
 # ---------------------------------------------------------------- helpers
 # Per-case globals: T (temp dir), SIMROOT, LOG (supervisor output), SUP (current supervisor pid)
@@ -55,6 +55,16 @@ wait_for() {
     local desc=$1; shift
     local i
     for ((i = 0; i < 150; i++)); do
+        if "$@" >/dev/null 2>&1; then return 0; fi
+        sleep 0.2
+    done
+    fail "timeout waiting for: $desc"
+}
+
+# wait_for_n <polls (0.2s each)> <description> <command...>
+wait_for_n() {
+    local n=$1 desc=$2 i; shift 2
+    for ((i = 0; i < n; i++)); do
         if "$@" >/dev/null 2>&1; then return 0; fi
         sleep 0.2
     done
@@ -303,6 +313,25 @@ it_no_sim_unchanged() {
     [ -s "$LOG" ] || fail "plain agent produced no log output"
     if grep -q '^\[' "$LOG"; then fail "log line with [ prefix: $(grep -m1 '^\[' "$LOG")"; fi
     if grep -q '^sim:' "$LOG"; then fail "supervisor output in plain mode"; fi
+}
+
+# Needs a reachable MQTT broker: MQTT_BROKER=host:port (skipped otherwise)
+it_mqtt_connect() {
+    if [ -z "${MQTT_BROKER:-}" ]; then
+        echo "SKIP it_mqtt_connect (MQTT_BROKER not set)" >&2
+        return 0
+    fi
+    local host=${MQTT_BROKER%:*} port=${MQTT_BROKER##*:} idx
+    [ -n "$host" ] && [ "$host" != "$MQTT_BROKER" ] || fail "MQTT_BROKER must be host:port, got '$MQTT_BROKER'"
+    sed -e "s|^Device.MQTT.Client.1.BrokerAddress .*|Device.MQTT.Client.1.BrokerAddress \"$host\"|" \
+        -e "s|^Device.MQTT.Client.1.BrokerPort .*|Device.MQTT.Client.1.BrokerPort \"$port\"|" \
+        "$HERE/mqtt_tmpl.txt" > "$T/mqtt_tmpl.txt"
+    grep -q "BrokerAddress \"$host\"" "$T/mqtt_tmpl.txt" || fail "broker substitution failed"
+    start_sup --sim-procs 2 --sim-per-proc 5 --sim-base 100 --sim-ramp 0 --sim-reset "$T/mqtt_tmpl.txt" -x "$PLUGIN"
+    mqtt_connected() { [ "$(getv "$1" Device.MQTT.Client.1.Status)" == "Connected" ]; }
+    for ((idx = 100; idx < 110; idx++)); do
+        wait_for_n 300 "cpe $idx MQTT Connected" mqtt_connected $idx
+    done
 }
 
 # ---------------------------------------------------------------- runner

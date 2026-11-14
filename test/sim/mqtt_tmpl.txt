@@ -1,0 +1,55 @@
+#
+# MQTT factory reset template for the CPE simulator (use with --sim-reset).
+# Derived from mqtt_factory_reset_example.txt in the repo root. The supervisor expands the
+# placeholders ${SN} ${EID} ${IDX} ... per CPE (see docs/sim/README.md).
+#
+# EDIT THESE: the broker the simulated CPEs connect to (and the controller's endpoint id).
+# test/sim/it_sim.sh it_mqtt_connect generates a copy of this file with the broker from MQTT_BROKER.
+#
+Device.MQTT.Client.1.BrokerAddress "127.0.0.1"
+Device.MQTT.Client.1.BrokerPort "1883"
+Device.LocalAgent.Controller.1.EndpointID "self::usp-controller"
+Device.MQTT.Client.1.Username ""
+Device.MQTT.Client.1.Password ""
+
+#
+# Per-CPE values
+#
+Device.MQTT.Client.1.ClientID "${SN}"
+Device.LocalAgent.MTP.1.MQTT.ResponseTopicConfigured "usp/agent/${EID}"
+
+#
+# Other parameters (same as the example)
+#
+Device.LocalAgent.MTP.1.Alias "cpe-1"
+Device.LocalAgent.MTP.1.Enable true
+Device.LocalAgent.MTP.1.Protocol "MQTT"
+Device.LocalAgent.MTP.1.MQTT.Reference "Device.MQTT.Client.1"
+
+Device.MQTT.Client.1.ProtocolVersion "5.0"
+Device.MQTT.Client.1.TransportProtocol "TCP/IP"
+Device.MQTT.Client.1.Alias "cpe-1"
+Device.MQTT.Client.1.Enable true
+Device.MQTT.Client.1.KeepAliveTime "60"
+Device.MQTT.Client.1.ConnectRetryTime "5"
+Device.MQTT.Client.1.ConnectRetryIntervalMultiplier   "2000"
+Device.MQTT.Client.1.ConnectRetryMaxInterval "30720"
+
+Device.LocalAgent.Controller.1.Alias "cpe-1"
+Device.LocalAgent.Controller.1.Enable true
+Device.LocalAgent.Controller.1.AssignedRole "Device.LocalAgent.ControllerTrust.Role.1"
+Device.LocalAgent.Controller.1.PeriodicNotifInterval "86400"
+Device.LocalAgent.Controller.1.PeriodicNotifTime "0001-01-01T00:00:00Z"
+Device.LocalAgent.Controller.1.USPNotifRetryMinimumWaitInterval "5"
+Device.LocalAgent.Controller.1.USPNotifRetryIntervalMultiplier "2000"
+Device.LocalAgent.Controller.1.ControllerCode ""
+Device.LocalAgent.Controller.1.MTP.1.Alias "cpe-1"
+Device.LocalAgent.Controller.1.MTP.1.Enable true
+Device.LocalAgent.Controller.1.MTP.1.Protocol "MQTT"
+Device.LocalAgent.Controller.1.MTP.1.MQTT.Reference "Device.MQTT.Client.1"
+Device.LocalAgent.Controller.1.MTP.1.MQTT.Topic "/usp/controller"
+
+Internal.Reboot.Cause "LocalFactoryReset"
+
+
+

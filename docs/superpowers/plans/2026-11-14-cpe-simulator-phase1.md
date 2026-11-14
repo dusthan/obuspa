@@ -321,6 +321,8 @@ Device.LocalAgent.Controller.1.EndpointID "self::ctrl-${SN}"
   Expected: 除 `it_persist_reboot` 中的 SSID 断言、`it_factory_reset` 中的 SSID 断言、`it_identities` 中的 MACAddress 断言（依赖 Task 6）以外，其余全部 PASS。脚本通过 `SKIP_PLUGIN_CHECKS=1` 跳过这三处断言。
 - [ ] **Step 5: 提交** — `git commit -m "feat(sim): multi-process supervisor and integration tests"`
 
+> **Task 5 实施偏差**（以 `test/sim/it_sim.sh` 为准）：持久化类用例（`it_persist_reboot`、`it_factory_reset`、`it_restart_keeps_identity`、`it_conf_mismatch`）用 `Device.LocalAgent.Controller.1.EndpointID` 代替 `Controller.1.Alias` 作为被持久化/被重置的值，因为核心不允许修改已设置的 Alias（模板 `reset_tmpl.txt` 相应增加 `EndpointID "self::ctrl-${SN}"`）。`it_crash_loop_backoff` 用 `-v 99`（启动即 exit 255）代替不存在的 `-x` 插件，因为 `-x` 加载失败只记日志、obuspa 继续运行；该用例也不带 `--sim-reset`。
+
 ---
 
 ### Task 6: tr181 mock 身份改写与持久化
