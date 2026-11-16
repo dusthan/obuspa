@@ -3243,6 +3243,12 @@ int Operate_GetFingerprint(dm_req_t *req, char *command_key, kv_vector_t *input_
 }
 
 #ifdef ADD_CERT_SUPPORT
+static char *GetMutableCertDir(void)
+{
+    char *sim_dir = getenv("USP_SIM_CERT_DIR");
+    return ((sim_dir != NULL) && (sim_dir[0] != '\0')) ? sim_dir : MUTABLE_CERT_DIR;
+}
+
 /*********************************************************************//**
 **
 ** LoadTrustStore_FromMutableCertDir
@@ -3257,7 +3263,7 @@ int Operate_GetFingerprint(dm_req_t *req, char *command_key, kv_vector_t *input_
 **************************************************************************/
 void LoadTrustStore_FromMutableCertDir(void)
 {
-    char *dir_path = MUTABLE_CERT_DIR;
+    char *dir_path = GetMutableCertDir();
     DIR *dir;
     struct dirent *entry;
     struct stat info;
@@ -3432,7 +3438,7 @@ int Operate_AddCertificate(dm_req_t *req, char *command_key, kv_vector_t *input_
     char default_alias[64];
     FILE *fp;
     int elements_written;
-    char *dir_path = MUTABLE_CERT_DIR;
+    char *dir_path = GetMutableCertDir();
 
     // Exit if no mutable cert directory has been specified
     if ((dir_path==NULL) || (dir_path[0] == '\0'))
@@ -3589,7 +3595,7 @@ int Operate_DeleteCertificate(dm_req_t *req, char *command_key, kv_vector_t *inp
     int items_to_move;
     char file_path[PATH_MAX];
     char path[MAX_DM_PATH];
-    char *dir_path = MUTABLE_CERT_DIR;
+    char *dir_path = GetMutableCertDir();
 
     // Exit if the cert's instance number is not in the range of instance numbers which are allowed to be deleted
     instance = inst1;

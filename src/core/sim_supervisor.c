@@ -497,16 +497,20 @@ static void ResetChildSignals(void)
 **************************************************************************/
 static int SetChildEnv(const sim_identity_t *id)
 {
-    char idx[32], mac[32], mock[PATH_MAX];
+    char idx[32], mac[32], mock[PATH_MAX], instance_dir[PATH_MAX], cert_dir[PATH_MAX];
     snprintf(idx, sizeof(idx), "%lu", id->idx);
     SIM_FormatMac(id->mac, true, mac, sizeof(mac));
     if (JoinPath(mock, sizeof(mock), id->dir, "mock.db") != 0) return -1;
+    // The certificate directory helper requires an absolute path, even for a relative --sim-root.
+    if (realpath(id->dir, instance_dir) == NULL ||
+        JoinPath(cert_dir, sizeof(cert_dir), instance_dir, "mutable_certs") != 0) return -1;
     if (setenv("USP_BOARD_OUI", id->oui, 1) != 0 ||
         setenv("USP_BOARD_SERIAL", id->sn, 1) != 0 ||
         setenv("USP_ENDPOINT_ID", id->eid, 1) != 0 ||
         setenv("USP_SIM_IDX", idx, 1) != 0 ||
         setenv("USP_SIM_MAC", mac, 1) != 0 ||
         setenv("USP_SIM_TAG", id->sn, 1) != 0 ||
+        setenv("USP_SIM_CERT_DIR", cert_dir, 1) != 0 ||
         setenv("TR181_MOCK_DB", mock, 1) != 0)
     {
         return -1;

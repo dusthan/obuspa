@@ -9,12 +9,24 @@
 
 ## 1. 快速开始
 
-构建（Linux；依赖见 `test/sim/docker/Dockerfile`）：
+在 Ubuntu 上先安装 CMake、编译器和开发库。若终端提示 `zsh: command not found: cmake`，执行以下命令后用 `cmake --version` 确认安装：
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+sudo apt update
+sudo apt install cmake build-essential pkg-config libssl-dev libcurl4-openssl-dev \
+    libsqlite3-dev zlib1g-dev libmosquitto-dev
+cmake --version
+```
+
+在仓库根目录构建模拟器和 mock 插件。这个配置保留 MQTT，关闭可选的 WebSockets：
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_WEBSOCKETS=OFF && \
+    cmake --build build -j"$(nproc)"
 make -C plugins/tr181_vendor            # 生成 plugins/tr181_vendor/libtr181_vendor.so
 ```
+
+如果需要 WebSockets，安装 `libwebsockets-dev`，通过 `pkg-config --modversion libwebsockets` 确认版本至少为 4.1.0，再用 `-DENABLE_WEBSOCKETS=ON` 配置。Ubuntu 24.04 的软件包满足版本要求，22.04 自带的 4.0.20 需要升级库或使用下文的 Docker 构建流程。
 
 仅验证模拟器、不连接 broker：
 
@@ -87,13 +99,14 @@ build/obuspa -s $R/cpe-$I/cli.sock -f $R/cpe-$I/usp.db -c operate "Device.Reboot
   cpe-00000000/      idx 以 8 位十进制补零
     usp.db           obuspa 数据库
     mock.db          tr181_vendor 插件的持久化（sqlite，TR181_MOCK_DB 指向它，supervisor 自动设置）
+    mutable_certs/   该实例可通过 USP 添加或删除的证书（启用 AddCertificate 支持时）
     reset.txt        展开占位符后的恢复出厂文件（仅在给了 --sim-reset 时）
     cli.sock         CLI socket
     agent.log        （仅 --sim-log file）
 ```
 
 每个子进程的环境变量由 supervisor 设置：`USP_SIM_IDX`（让退出码生效）、`USP_SIM_MAC`、`USP_SIM_TAG`（= SN，日志前缀）、
-`USP_BOARD_SERIAL`、`USP_BOARD_OUI`、`USP_ENDPOINT_ID`、`TR181_MOCK_DB`。插件侧说明见 `plugins/tr181_vendor/README.md`。
+`USP_BOARD_SERIAL`、`USP_BOARD_OUI`、`USP_ENDPOINT_ID`、`USP_SIM_CERT_DIR`（指向实例证书目录）、`TR181_MOCK_DB`。插件侧说明见 `plugins/tr181_vendor/README.md`。
 
 ## 4. 身份与占位符
 
@@ -126,6 +139,10 @@ Device.LocalAgent.Controller.1.EndpointID "self::usp-controller"
 调试时使用新的 `--sim-root`，或通过 CLI 修改已有 MQTT 参数。`--sim-reidentify` 在身份参数不变时不会强制恢复出厂。
 容器内 `127.0.0.1` 指容器自身；外部 broker 应填写容器可访问的主机名/IP。
 此示例使用明文 TCP MQTT 5.0、空用户名和密码；实际环境的认证、TLS、ACL 和 controller topic 需按目标系统配置。
+
+如果旧版模拟器启动时报 `/usr/local/var` 的权限错误，请重新编译本分支并沿用原来可写的 `--sim-root`。新版把可写证书保存在每台 CPE 目录中，普通用户即可运行。
+旧版还会在明文 MQTT 连接成功时打印 `No cert chain`。新版仅在 TLS 连接缺少证书链时记录该错误。
+可以通过 CLI 读取 `Device.MQTT.Client.1.Status` 确认 broker 连接状态。使用明文连接时不会从证书链推导 Controller 信任角色。
 
 ## 5. 生命周期、退出码与 `--sim-reidentify`
 

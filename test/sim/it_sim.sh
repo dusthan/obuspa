@@ -99,7 +99,7 @@ STD_ARGS() { echo --sim-base 100 --sim-ramp 0 --sim-reset "$TMPL" -x "$PLUGIN"; 
 # ---------------------------------------------------------------- cases
 it_identities() {
     start_sup --sim-procs 2 --sim-per-proc 3 $(STD_ARGS)
-    local idx n hex
+    local idx n hex cert_dir
     for idx in 100 101 102 103 104 105; do
         wait_for "cpe $idx ready" is_ready $idx
     done
@@ -113,6 +113,8 @@ it_identities() {
         expect_eq "SN $idx" "$(getv $idx Device.DeviceInfo.SerialNumber)" "SIM00000$idx"
         expect_eq "EID $idx" "$(getv $idx Device.LocalAgent.EndpointID)" "os::012345-SIM00000$idx"
         expect_eq "Alias $idx" "$(getv $idx Device.LocalAgent.Controller.1.Alias)" "ctrl-$idx"
+        cert_dir="$(cpedir "$idx")/mutable_certs"
+        [[ -d "$cert_dir" && -w "$cert_dir" ]] || fail "missing writable certificate directory for cpe $idx"
         if [ "$SKIP_PLUGIN_CHECKS" != 1 ]; then
             hex=$(printf %02X "$idx")
             expect_eq "MAC $idx" "$(getv $idx Device.Ethernet.Interface.1.MACAddress)" "02:00:00:00:$hex:53"
@@ -330,6 +332,9 @@ it_mqtt_connect() {
     stop_sup
     expect_eq "MQTT supervisor shutdown rc" "$SUP_RC" 0
     no_cpe_procs || fail "MQTT CPE processes left after shutdown"
+    if grep -Fq 'Failed to determine controller trust role - No cert chain' "$LOG"; then
+        fail "plaintext MQTT reported a missing TLS certificate chain"
+    fi
 }
 
 # ---------------------------------------------------------------- runner

@@ -2876,7 +2876,7 @@ void ConnectCallback(struct mosquitto *mosq, void *userdata, int result)
             // Free the cert chain, now that we've finished with it
             FreeMqttClientCertChain(client);
         }
-        else
+        else if (client->conn_params.ts_protocol == kMqttTSprotocol_tls)
         {
             USP_LOG_Error("%s: Failed to determine controller trust role - No cert chain", __FUNCTION__);
         }
@@ -2955,7 +2955,7 @@ void ConnectV5Callback(struct mosquitto *mosq, void *userdata, int result, int f
             // Free the cert chain, now that we've finished with it
             FreeMqttClientCertChain(client);
         }
-        else
+        else if (client->conn_params.ts_protocol == kMqttTSprotocol_tls)
         {
             USP_LOG_Error("%s: Failed to determine controller trust role - No cert chain", __FUNCTION__);
         }
